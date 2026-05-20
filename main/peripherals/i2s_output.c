@@ -109,6 +109,46 @@ esp_err_t i2s_output_deinit(void)
     return (ret != ESP_OK) ? ret : del_ret;
 }
 
+esp_err_t i2s_output_write(const int16_t *pcm_data, size_t sample_count)
+{
+    if (pcm_data == NULL || sample_count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (s_tx_chan == NULL) {
+        esp_err_t ret = i2s_output_init(NULL);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    const uint8_t *data = (const uint8_t *)pcm_data;
+    size_t bytes_remaining = sample_count * sizeof(pcm_data[0]);
+
+    while (bytes_remaining > 0) {
+        size_t bytes_written = 0;
+        esp_err_t ret = i2s_channel_write(
+            s_tx_chan,
+            data,
+            bytes_remaining,
+            &bytes_written,
+            portMAX_DELAY
+        );
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        if (bytes_written == 0) {
+            return ESP_FAIL;
+        }
+
+        data += bytes_written;
+        bytes_remaining -= bytes_written;
+    }
+
+    return ESP_OK;
+}
+
 esp_err_t i2s_output_play_sine(uint32_t frequency_hz, uint32_t duration_ms)
 {
     if (s_tx_chan == NULL) {

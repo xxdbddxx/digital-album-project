@@ -6,9 +6,11 @@ idf_component_register(
         "peripherals/he30.c"
         "peripherals/pcf8574_io.c"
         "peripherals/i2s_output.c"
+        "services/audio_player.c"
     INCLUDE_DIRS
         "."
         "peripherals"
+        "services"
     REQUIRES
         driver
         esp_driver_i2s

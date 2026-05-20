@@ -1,14 +1,15 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "i2s_output.h"
+#include "audio_player.h"
 #include "peripherals.h"
 
 
 void app_main(void)
 {
-	i2s_output_init(NULL);
+	audio_player_init();
+	audio_player_play_effect(AUDIO_EFFECT_STARTUP);
 	vTaskDelay(pdMS_TO_TICKS(500));
-	i2s_output_play_test_tone();
+	audio_player_play_effect(AUDIO_EFFECT_CLICK);
 	app_peripherals_init();
 }
