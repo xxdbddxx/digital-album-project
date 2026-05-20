@@ -26,6 +26,10 @@ esp_err_t audio_player_play_pcm(const int16_t *pcm_data,
                                 size_t sample_count,
                                 uint32_t sample_rate);
 
+esp_err_t audio_player_play_wav_file(const char *path);
+
+esp_err_t audio_player_play_tts_file(const char *path);
+
 esp_err_t audio_player_stop(void);
 
 bool audio_player_is_playing(void);

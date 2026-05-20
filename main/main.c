@@ -9,6 +9,7 @@ void app_main(void)
 {
 	audio_player_init();
 	audio_player_play_effect(AUDIO_EFFECT_STARTUP);
+	// audio_player_play_wav_file("/spiffs/tts_reply.wav");
 	vTaskDelay(pdMS_TO_TICKS(500));
 	audio_player_play_effect(AUDIO_EFFECT_CLICK);
 	app_peripherals_init();
