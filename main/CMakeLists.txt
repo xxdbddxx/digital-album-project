@@ -5,11 +5,13 @@ idf_component_register(
         "peripherals/peripherals.c"
         "peripherals/he30.c"
         "peripherals/pcf8574_io.c"
+        "peripherals/i2s_output.c"
     INCLUDE_DIRS
         "."
         "peripherals"
     REQUIRES
         driver
+        esp_driver_i2s
         freertos
         espressif__aht20
         heap
