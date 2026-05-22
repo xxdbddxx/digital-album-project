@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "main.c"
+        "app/app_event.c"
         "peripherals/aht20_sensor.c"
         "peripherals/peripherals.c"
         "peripherals/he30.c"
@@ -10,6 +11,7 @@ idf_component_register(
         "services/aroma_ctrl.c"
     INCLUDE_DIRS
         "."
+        "app"
         "peripherals"
         "services"
     REQUIRES
