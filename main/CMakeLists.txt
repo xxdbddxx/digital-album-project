@@ -7,6 +7,7 @@ idf_component_register(
         "peripherals/he30.c"
         "peripherals/pcf8574_io.c"
         "peripherals/i2s_output.c"
+        "peripherals/i2s_mic_input.c"
         "services/audio_player.c"
         "services/aroma_ctrl.c"
     INCLUDE_DIRS
