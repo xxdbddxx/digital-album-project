@@ -13,6 +13,15 @@ extern "C" {
 #define I2S_MIC_INPUT_SAMPLE_RATE_HZ 16000
 #define I2S_MIC_INPUT_BITS_PER_SAMPLE 16
 
+/*
+ * INMP441 wiring:
+ * SCK/BCLK -> GPIO11, WS/LRCLK -> GPIO12, SD/DOUT -> GPIO13.
+ * L/R can be tied to GND for the left channel.
+ *
+ * i2s_mic_input and i2s_output are still independent modules. If recording and
+ * playback must run at the same time, unify I2S bus/channel initialization so
+ * BCLK/WS are not driven by two independent modules.
+ */
 #ifndef MIC_I2S_BCLK_GPIO
 #define MIC_I2S_BCLK_GPIO GPIO_NUM_11
 #endif

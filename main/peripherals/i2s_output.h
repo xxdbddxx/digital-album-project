@@ -15,16 +15,25 @@ extern "C" {
 #define I2S_OUTPUT_DEFAULT_TONE_HZ         440
 #define I2S_OUTPUT_DEFAULT_TONE_MS         1000
 
+/*
+ * MAX98357A wiring:
+ * BCLK/LRCLK share GPIO11/GPIO12 with the INMP441 I2S clock lines.
+ * DIN is driven by ESP32-S3 GPIO4.
+ *
+ * i2s_output and i2s_mic_input are still independent modules. If playback and
+ * recording must run at the same time, unify I2S bus/channel initialization so
+ * BCLK/WS are not driven by two independent modules.
+ */
 #ifndef I2S_OUTPUT_DEFAULT_BCLK_GPIO
-#define I2S_OUTPUT_DEFAULT_BCLK_GPIO GPIO_NUM_4
+#define I2S_OUTPUT_DEFAULT_BCLK_GPIO GPIO_NUM_11
 #endif
 
 #ifndef I2S_OUTPUT_DEFAULT_WS_GPIO
-#define I2S_OUTPUT_DEFAULT_WS_GPIO GPIO_NUM_5
+#define I2S_OUTPUT_DEFAULT_WS_GPIO GPIO_NUM_12
 #endif
 
 #ifndef I2S_OUTPUT_DEFAULT_DOUT_GPIO
-#define I2S_OUTPUT_DEFAULT_DOUT_GPIO GPIO_NUM_6
+#define I2S_OUTPUT_DEFAULT_DOUT_GPIO GPIO_NUM_4
 #endif
 
 typedef struct {
