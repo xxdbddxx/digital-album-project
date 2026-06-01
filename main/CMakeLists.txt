@@ -10,6 +10,7 @@ idf_component_register(
         "peripherals/i2s_mic_input.c"
         "services/audio_player.c"
         "services/aroma_ctrl.c"
+        "services/mic_service.c"
     INCLUDE_DIRS
         "."
         "app"
