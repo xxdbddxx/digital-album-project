@@ -67,7 +67,7 @@ IO11 / IO12 / IO13 从 TF 卡槽转接板引出，给 INMP441 使用：
 
 ### 4. MAX98357A I2S 功放接线
 
-MAX98357A 不能只接 DIN，还需要接 I2S 时钟。当前硬件方案中，MAX98357A 与 INMP441 共用 GPIO11 / GPIO12 作为 I2S BCLK / LRCLK，GPIO4 单独作为功放数据输出。
+MAX98357A 不能只接 DIN，还需要接 I2S 时钟。当前硬件方案中，MAX98357A 与 INMP441 共用 GPIO11 / GPIO12 作为 I2S BCLK / LRCLK，GPIO6（板载 Sensor AD 接口的 AD/IO6）单独作为功放数据输出。
 
 | MAX98357A 引脚 | ESP32-S3 引脚 | 说明 |
 |---|---|---|
@@ -75,9 +75,11 @@ MAX98357A 不能只接 DIN，还需要接 I2S 时钟。当前硬件方案中，M
 | GND | GND | 与 ESP32 共地 |
 | BCLK | GPIO11 | I2S Bit Clock，与 INMP441 共用 |
 | LRC / WS | GPIO12 | I2S Word Select / LRCLK，与 INMP441 共用 |
-| DIN | GPIO4 | I2S 数据输入，接 ESP32 I2S SPK DOUT |
+| DIN | GPIO6 / Sensor AD 的 AD/IO6 | I2S 数据输入，接 ESP32 I2S SPK DOUT |
 | SPK+ | 扬声器 + | 接喇叭正极 |
 | SPK- | 扬声器 - | 接喇叭负极 |
+
+GPIO6 / Sensor AD 当前复用为 MAX98357A DIN。GPIO4 / J2 INT / CTP_IRQ 不再作为功放 DIN。AD/IO6 只提供功放数据输入信号，不给 MAX98357A 供电；MAX98357A 仍需连接 5V 供电，并与 ESP32 共地。
 
 注意：当前 `i2s_output` 和 `i2s_mic_input` 仍是独立模块。如果后续需要同时录音和播放，需要进一步统一 I2S 总线初始化，避免 BCLK / WS 被两个模块重复驱动。
 
@@ -138,7 +140,7 @@ HE30 和雾化模块的供电应按 HE30 模块规格连接。ESP32 和 PCF8574 
 | INMP441 SD / DOUT | GPIO13 | `i2s_mic_input` |
 | MAX98357A BCLK | GPIO11 | `i2s_output` |
 | MAX98357A LRC / WS | GPIO12 | `i2s_output` |
-| MAX98357A DIN | GPIO4 | `i2s_output` |
+| MAX98357A DIN | GPIO6 / Sensor AD 的 AD/IO6 | `i2s_output` |
 | 香氛 CH1 | PCF8574 P0 -> HE30 香氛 1 控制输入 | `aroma_ctrl` |
 | 香氛 CH2 | PCF8574 P1 -> HE30 香氛 2 控制输入 | `aroma_ctrl` |
 | 香氛 CH3 | PCF8574 P2 -> HE30 香氛 3 控制输入 | `aroma_ctrl` |

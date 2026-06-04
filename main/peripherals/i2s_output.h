@@ -18,7 +18,7 @@ extern "C" {
 /*
  * MAX98357A wiring:
  * BCLK/LRCLK share GPIO11/GPIO12 with the INMP441 I2S clock lines.
- * DIN is driven by ESP32-S3 GPIO4.
+ * DIN is driven by ESP32-S3 GPIO6 through the Sensor AD AD/IO6 pin.
  *
  * i2s_output and i2s_mic_input are still independent modules. If playback and
  * recording must run at the same time, unify I2S bus/channel initialization so
@@ -33,7 +33,7 @@ extern "C" {
 #endif
 
 #ifndef I2S_OUTPUT_DEFAULT_DOUT_GPIO
-#define I2S_OUTPUT_DEFAULT_DOUT_GPIO GPIO_NUM_4
+#define I2S_OUTPUT_DEFAULT_DOUT_GPIO GPIO_NUM_6
 #endif
 
 typedef struct {
