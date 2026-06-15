@@ -15,6 +15,7 @@ enum {
     wav_supported_channels = 1,
     wav_supported_sample_rate_16k = 16000,
     wav_supported_sample_rate_24k = 24000,
+    trailing_silence_ms = 200,
 };
 
 static bool s_initialized;
@@ -212,6 +213,15 @@ static esp_err_t audio_player_effect_tone(audio_effect_t effect, audio_effect_to
     }
 }
 
+static esp_err_t audio_player_write_trailing_silence(void)
+{
+    esp_err_t ret = i2s_output_write_silence(trailing_silence_ms);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to write trailing silence: %s", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
 esp_err_t audio_player_init(void)
 {
     if (s_initialized) {
@@ -246,6 +256,11 @@ esp_err_t audio_player_play_effect(audio_effect_t effect)
     ret = i2s_output_play_sine(tone.frequency_hz, tone.duration_ms);
     s_is_playing = false;
 
+    esp_err_t silence_ret = audio_player_write_trailing_silence();
+    if (ret == ESP_OK) {
+        ret = silence_ret;
+    }
+
     return ret;
 }
 
@@ -269,6 +284,11 @@ esp_err_t audio_player_play_pcm(const int16_t *pcm_data,
     s_is_playing = true;
     ret = i2s_output_write(pcm_data, sample_count);
     s_is_playing = false;
+
+    esp_err_t silence_ret = audio_player_write_trailing_silence();
+    if (ret == ESP_OK) {
+        ret = silence_ret;
+    }
 
     return ret;
 }
@@ -343,6 +363,10 @@ esp_err_t audio_player_play_wav_file(const char *path)
 
     s_is_playing = false;
     fclose(file);
+    esp_err_t silence_ret = audio_player_write_trailing_silence();
+    if (ret == ESP_OK) {
+        ret = silence_ret;
+    }
     return ret;
 }
 
@@ -354,7 +378,7 @@ esp_err_t audio_player_play_tts_file(const char *path)
 esp_err_t audio_player_stop(void)
 {
     s_is_playing = false;
-    return ESP_OK;
+    return audio_player_write_trailing_silence();
 }
 
 bool audio_player_is_playing(void)

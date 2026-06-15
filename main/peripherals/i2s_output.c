@@ -149,6 +149,36 @@ esp_err_t i2s_output_write(const int16_t *pcm_data, size_t sample_count)
     return ESP_OK;
 }
 
+esp_err_t i2s_output_write_silence(uint32_t duration_ms)
+{
+    if (duration_ms == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    enum {
+        samples_per_chunk = 256,
+    };
+
+    int16_t samples[samples_per_chunk] = {0};
+    uint32_t samples_remaining = (uint32_t)(((uint64_t)s_sample_rate_hz * duration_ms) / 1000);
+
+    while (samples_remaining > 0) {
+        size_t chunk_samples = samples_remaining;
+        if (chunk_samples > samples_per_chunk) {
+            chunk_samples = samples_per_chunk;
+        }
+
+        esp_err_t ret = i2s_output_write(samples, chunk_samples);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        samples_remaining -= chunk_samples;
+    }
+
+    return ESP_OK;
+}
+
 esp_err_t i2s_output_play_sine(uint32_t frequency_hz, uint32_t duration_ms)
 {
     if (s_tx_chan == NULL) {
