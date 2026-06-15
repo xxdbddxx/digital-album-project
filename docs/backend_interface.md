@@ -48,7 +48,7 @@ IO8 / IO9 是 I2C 总线：
 | GND | GND | 与 ESP32 共地 |
 | SDA | GPIO8 | I2C 数据线 |
 | SCL | GPIO9 | I2C 时钟线 |
-| A0 / A1 / A2 | 按模块地址配置 | 当前软件默认地址为 `0x27`，实际地址需与模块焊盘/拨码一致 |
+| A0 / A1 / A2 | 按模块地址配置 | 当前软件默认地址为 `0x20`，实际地址需与模块焊盘/拨码一致 |
 
 注意：PCF8574 只用于低速 IO 控制，不直接驱动雾化器、功放或其他大电流负载。
 
@@ -134,7 +134,7 @@ HE30 和雾化模块的供电应按 HE30 模块规格连接。ESP32 和 PCF8574 
 |---|---|---|
 | I2C SDA | GPIO8 | `pcf8574_io` / `aht20_sensor` |
 | I2C SCL | GPIO9 | `pcf8574_io` / `aht20_sensor` |
-| PCF8574 地址 | `0x27` | `pcf8574_io` |
+| PCF8574 地址 | `0x20` | `pcf8574_io` |
 | INMP441 BCLK / SCK | GPIO11 | `i2s_mic_input` |
 | INMP441 WS / LRCLK | GPIO12 | `i2s_mic_input` |
 | INMP441 SD / DOUT | GPIO13 | `i2s_mic_input` |

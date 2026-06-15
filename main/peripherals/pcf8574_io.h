@@ -7,7 +7,7 @@
 #include "esp_err.h"
 
 #ifndef PCF8574_I2C_ADDR
-#define PCF8574_I2C_ADDR 0x27
+#define PCF8574_I2C_ADDR 0x20
 #endif
 
 typedef enum {
