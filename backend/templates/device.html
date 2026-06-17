@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+
+{% block title %}物理设备台 - 云端电子相册{% endblock %}
+
+{% block content %}
+<div class="dashboard-grid" id="device-dashboard">
+    <div class="card status-panel">
+        <h3 style="margin-bottom:32px; color:var(--muted);">设备状态</h3>
+        <div class="status-circle offline" id="status-circle">
+            <div style="font-size:3rem;" id="status-icon">▣</div>
+        </div>
+        <div style="font-weight:700; font-size:1.2rem; margin-bottom:24px;" id="status-lbl">设备离线</div>
+        <div style="display:flex; justify-content:space-around; width:100%; border-top:1px solid hsl(var(--h-border), var(--s-border), var(--l-border)); padding-top:24px;">
+            <div>
+                <div class="status-lbl">FPS</div>
+                <div class="status-val" style="color:var(--accent)" id="val-fps">--</div>
+            </div>
+            <div>
+                <div class="status-lbl">可用内存</div>
+                <div class="status-val" style="color:var(--success)" id="val-mem">--</div>
+            </div>
+        </div>
+        <div style="margin-top:24px; text-align:left; word-break:break-all;">
+            <div class="status-lbl">当前照片 ID</div>
+            <div style="font-weight:700; margin-top:6px;" id="current-photo-id">--</div>
+        </div>
+        <div style="margin-top:18px; text-align:left;">
+            <div class="status-lbl">显示方向</div>
+            <div style="font-weight:700; margin-top:6px;" id="display-orientation">--</div>
+            <div style="color:var(--muted); font-size:0.8rem; margin-top:4px;" id="orientation-sync">--</div>
+        </div>
+    </div>
+
+    <div class="card" style="display:flex; flex-direction:column; justify-content:space-between;">
+        <div>
+            <h2 style="margin-bottom: 8px;">远程面板</h2>
+            <p style="color:var(--muted); font-size:0.9rem;">
+                命令会进入服务器队列，ESP32 下一次轮询时执行。
+            </p>
+
+            <h3 style="margin-top:32px; font-size:1rem;">香薰控制</h3>
+            <div class="aroma-grid">
+                <div class="aroma-card" id="aroma-0">
+                    <div class="icon">●</div>
+                    <div style="font-weight:600;">通道 1</div>
+                    <div style="font-size:0.8rem; color:var(--muted); margin-top:4px;">香薰/雾化</div>
+                </div>
+                <div class="aroma-card" id="aroma-1">
+                    <div class="icon">●</div>
+                    <div style="font-weight:600;">通道 2</div>
+                    <div style="font-size:0.8rem; color:var(--muted); margin-top:4px;">香薰/雾化</div>
+                </div>
+                <div class="aroma-card" id="aroma-2">
+                    <div class="icon">●</div>
+                    <div style="font-weight:600;">通道 3</div>
+                    <div style="font-size:0.8rem; color:var(--muted); margin-top:4px;">香薰/雾化</div>
+                </div>
+            </div>
+
+            <h3 style="margin-top:32px; font-size:1rem;">屏幕方向</h3>
+            <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                <button class="btn btn-outline" id="btn-landscape" style="padding:10px 18px;">横屏</button>
+                <button class="btn btn-outline" id="btn-portrait" style="padding:10px 18px;">竖屏</button>
+            </div>
+        </div>
+
+        <div class="remote-ctrl-area">
+            <h3 style="margin-bottom:16px; font-size:1rem;">照片切换</h3>
+            <div style="display:flex; gap:12px; justify-content:center; flex-wrap:wrap;">
+                <button class="btn btn-outline" id="btn-prev" style="padding:14px 28px;">上一张</button>
+                <button class="btn btn-primary" id="btn-next" style="padding:14px 28px;">下一张</button>
+            </div>
+            <p style="color:var(--muted); font-size:0.8rem; margin-top:12px;">
+                当前 ID 会随设备心跳更新，通常有几秒延迟。
+            </p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+    const statusCircle = document.getElementById("status-circle");
+    const statusLbl = document.getElementById("status-lbl");
+    const valFps = document.getElementById("val-fps");
+    const valMem = document.getElementById("val-mem");
+    const currentPhotoId = document.getElementById("current-photo-id");
+    const displayOrientation = document.getElementById("display-orientation");
+    const orientationSync = document.getElementById("orientation-sync");
+    const btnPrev = document.getElementById("btn-prev");
+    const btnNext = document.getElementById("btn-next");
+    const btnLandscape = document.getElementById("btn-landscape");
+    const btnPortrait = document.getElementById("btn-portrait");
+
+    async function sendControl(payload) {
+        const res = await fetch("/api/device/control", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
+        return await res.json();
+    }
+
+    function renderOrientation(orientation) {
+        displayOrientation.textContent = orientation === "portrait" ? "竖屏" : "横屏";
+        btnLandscape.classList.toggle("btn-primary", orientation !== "portrait");
+        btnLandscape.classList.toggle("btn-outline", orientation === "portrait");
+        btnPortrait.classList.toggle("btn-primary", orientation === "portrait");
+        btnPortrait.classList.toggle("btn-outline", orientation !== "portrait");
+    }
+
+    async function pollStatus() {
+        try {
+            const res = await fetch("/api/device/status");
+            const data = await res.json();
+            if (data.online) {
+                statusCircle.classList.remove("offline");
+                statusCircle.classList.add("online");
+                statusLbl.textContent = "设备在线";
+                valFps.textContent = data.fps > 0 ? data.fps.toFixed(1) : "30.0";
+                valMem.textContent = data.free_mem > 0 ? (data.free_mem / 1024).toFixed(1) + " KB" : "--";
+            } else {
+                statusCircle.classList.remove("online");
+                statusCircle.classList.add("offline");
+                statusLbl.textContent = "设备离线";
+                valFps.textContent = "--";
+                valMem.textContent = "--";
+            }
+            currentPhotoId.textContent = data.current_photo_id || "--";
+            const orientation = data.desired_orientation || data.display_orientation || "landscape";
+            renderOrientation(orientation);
+            const reported = data.reported_orientation || "landscape";
+            orientationSync.textContent = !data.online
+                ? "等待设备上线"
+                : data.orientation_synced
+                ? "已同步"
+                : `同步中，设备当前为${reported === "portrait" ? "竖屏" : "横屏"}`;
+
+            if (Array.isArray(data.aroma_channels)) {
+                data.aroma_channels.forEach((state, i) => {
+                    const card = document.getElementById(`aroma-${i}`);
+                    if (!card) return;
+                    card.classList.toggle("active", state === 1);
+                    card.dataset.state = state;
+                });
+            }
+        } catch (err) {
+            console.error("device status failed", err);
+        }
+    }
+
+    btnPrev.addEventListener("click", () => sendControl({ cmd: "switch_photo", target_id: "prev" }));
+    btnNext.addEventListener("click", () => sendControl({ cmd: "switch_photo", target_id: "next" }));
+    btnLandscape.addEventListener("click", async () => {
+        renderOrientation("landscape");
+        orientationSync.textContent = "同步中";
+        await sendControl({ cmd: "set_orientation", orientation: "landscape" });
+    });
+    btnPortrait.addEventListener("click", async () => {
+        renderOrientation("portrait");
+        orientationSync.textContent = "同步中";
+        await sendControl({ cmd: "set_orientation", orientation: "portrait" });
+    });
+
+    for (let i = 0; i < 3; i++) {
+        const card = document.getElementById(`aroma-${i}`);
+        card?.addEventListener("click", async () => {
+            const currentState = parseInt(card.dataset.state || "0", 10);
+            const nextState = currentState === 1 ? 0 : 1;
+            const data = await sendControl({ cmd: "toggle_aroma", channel: i, state: nextState });
+            if (data.ok) {
+                card.classList.toggle("active", nextState === 1);
+                card.dataset.state = nextState;
+            }
+        });
+    }
+
+    pollStatus();
+    setInterval(pollStatus, 1000);
+});
+</script>
+{% endblock %}

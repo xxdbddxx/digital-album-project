@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+
+{% block title %}设备照片库 - 云端电子相册{% endblock %}
+
+{% block content %}
+<div style="display:flex; justify-content:space-between; align-items:flex-start; gap:24px; margin-bottom:24px;">
+    <div>
+        <h1 style="font-size:1.8rem; margin-bottom:6px;">设备照片库</h1>
+        <p style="color:var(--muted); font-size:0.95rem;">这里管理 ESP32 实际会轮播和下载的照片。上传图片会自动加入此库。</p>
+    </div>
+    <label style="display:flex; align-items:center; gap:8px; color:var(--muted); font-size:0.9rem;">
+        <input type="checkbox" id="show-hidden">
+        显示已隐藏
+    </label>
+</div>
+
+<div class="gallery" id="device-library-grid"></div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+    const grid = document.getElementById("device-library-grid");
+    const showHidden = document.getElementById("show-hidden");
+
+    async function requestJson(url, options = {}) {
+        const res = await fetch(url, {
+            headers: { "Content-Type": "application/json" },
+            ...options
+        });
+        return await res.json();
+    }
+
+    async function loadLibrary() {
+        const includeHidden = showHidden.checked ? "1" : "0";
+        const data = await requestJson(`/api/device-library?include_hidden=${includeHidden}`);
+        if (!data.photos || data.photos.length === 0) {
+            grid.innerHTML = `<div style="color:var(--muted);">设备照片库为空。</div>`;
+            return;
+        }
+
+        grid.innerHTML = data.photos.map(p => `
+            <div class="photo-card" data-id="${p.id}" data-hidden="${p.hidden ? "1" : "0"}">
+                <div class="img-wrap">
+                    <img src="${p.preview_url}?t=${Date.now()}" loading="lazy" alt="${p.id}">
+                </div>
+                <div class="meta">
+                    <div class="side-caption">
+                        <span>${escapeHtml(p.caption || p.id)}</span>
+                    </div>
+                    <div class="scores" style="display:block; line-height:1.6;">
+                        <div>ID: <code>${p.id}</code></div>
+                        <div>来源: ${p.source_type || "library"} ${p.hidden ? " / 已隐藏" : ""}</div>
+                        <div>日期: ${p.target_date || "-"}</div>
+                    </div>
+                    <input class="form-control caption-input" value="${escapeAttr(p.caption || "")}" maxlength="256" style="margin-top:12px;">
+                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                        <button class="btn btn-primary save-caption" style="padding:8px 12px;">保存文案</button>
+                        <button class="btn btn-outline toggle-hidden" style="padding:8px 12px;">${p.hidden ? "恢复显示" : "隐藏"}</button>
+                        <button class="btn btn-outline remove-photo" style="padding:8px 12px; color:var(--danger); border-color:var(--danger);">移出设备库</button>
+                    </div>
+                </div>
+            </div>
+        `).join("");
+
+        grid.querySelectorAll(".photo-card").forEach(card => {
+            const id = card.dataset.id;
+            card.querySelector(".save-caption").addEventListener("click", async () => {
+                const caption = card.querySelector(".caption-input").value;
+                const res = await requestJson("/api/device-library/update", {
+                    method: "POST",
+                    body: JSON.stringify({ id, caption })
+                });
+                if (res.ok) loadLibrary();
+            });
+            card.querySelector(".toggle-hidden").addEventListener("click", async () => {
+                const hidden = card.dataset.hidden !== "1";
+                const res = await requestJson("/api/device-library/update", {
+                    method: "POST",
+                    body: JSON.stringify({ id, hidden })
+                });
+                if (res.ok) loadLibrary();
+            });
+            card.querySelector(".remove-photo").addEventListener("click", async () => {
+                if (!confirm(`从设备照片库移除 ${id}？对应的设备端图片文件也会删除。`)) return;
+                const res = await requestJson("/api/device-library/delete", {
+                    method: "POST",
+                    body: JSON.stringify({ id })
+                });
+                if (res.ok) loadLibrary();
+            });
+        });
+    }
+
+    function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, ch => ({
+            "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+        }[ch]));
+    }
+
+    function escapeAttr(value) {
+        return escapeHtml(value).replace(/`/g, "&#96;");
+    }
+
+    showHidden.addEventListener("change", loadLibrary);
+    loadLibrary();
+});
+</script>
+{% endblock %}
