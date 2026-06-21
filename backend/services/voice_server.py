@@ -111,7 +111,8 @@ MUSIC_KEYWORD_MAP = {
     "雨声": "insomnia", "下雨": "insomnia", "助眠": "insomnia",
     "手碟": "anxiety", "放松": "anxiety", "焦虑": "anxiety",
     "颂钵": "meditation", "冥想": "meditation", "禅": "meditation",
-    "钢琴": "sad", "轻音乐": "sad",
+    "钢琴": "sad", "轻音乐": "sad", "悲伤": "sad", "伤感": "sad",
+    "难过": "sad", "孤独": "sad", "低落": "sad", "忧郁": "sad",
     "篝火": "tired", "火焰": "tired",
     "森林": "relax", "溪流": "relax", "自然": "relax",
     "欢快": "happy", "开心": "happy", "流行": "happy",
@@ -169,6 +170,26 @@ def _music_catalog() -> list[dict]:
 def _available_music_files() -> list[str]:
     return [item["filename"] for item in _music_catalog()]
 
+@lru_cache(maxsize=1)
+def _music_tag_manifest() -> dict[str, list[str]]:
+    manifest_path = Path(ROOT_DIR).parent / "music_tags.json"
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Music tag manifest unavailable: {exc}")
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(filename): [
+            str(tag).strip().lower()
+            for tag in tags
+            if str(tag).strip()
+        ]
+        for filename, tags in raw.items()
+        if isinstance(tags, list)
+    }
+
 def _select_music_file(query: str, user_text: str = "") -> str:
     """Resolve a model/user music request to one local MP3 file."""
     catalog = _music_catalog()
@@ -178,6 +199,7 @@ def _select_music_file(query: str, user_text: str = "") -> str:
     combined = f"{query or ''} {user_text or ''}".strip().lower()
     normalized = re.sub(r"\.(mp3|pcm)\b", "", combined)
     compact = re.sub(r"[\s_-]+", "", normalized)
+    tag_manifest = _music_tag_manifest()
 
     # Match filename, ID3 title, artist, and title+artist before categories.
     best_filename = ""
@@ -187,6 +209,7 @@ def _select_music_file(query: str, user_text: str = "") -> str:
         stem = item["stem"].lower()
         title = item["title"].lower()
         artist = item["artist"].lower()
+        tags = tag_manifest.get(filename, [])
         score = 0
         if title and title in normalized:
             score += 100
@@ -196,6 +219,10 @@ def _select_music_file(query: str, user_text: str = "") -> str:
             score += 30
         if stem in normalized or re.sub(r"[\s_-]+", "", stem) in compact:
             score += 80
+        for tag in tags:
+            compact_tag = re.sub(r"[\s_-]+", "", tag)
+            if tag in normalized or (compact_tag and compact_tag in compact):
+                score += 60
         if score > best_score:
             best_score = score
             best_filename = filename
@@ -327,6 +354,19 @@ def _extract_tts_text(llm_text: str) -> str:
     except Exception:
         pass
     return llm_text
+
+def _extract_dialogue_emotion(llm_text: str) -> str:
+    allowed = {"happy", "sad", "empathic", "neutral"}
+    if not llm_text:
+        return "neutral"
+    try:
+        parsed = json.loads(llm_text)
+        emotion = str((parsed.get("dialogue") or {}).get("emotion") or "")
+    except Exception:
+        match = re.search(r'"emotion"\s*:\s*"([^"]+)"', llm_text)
+        emotion = match.group(1) if match else ""
+    emotion = emotion.strip().lower()
+    return emotion if emotion in allowed else "neutral"
 
 def _extract_photo_search_query(text: str) -> str:
     value = (text or "").strip()
@@ -951,6 +991,11 @@ class VoiceServer:
                 client_ip, tts_queue, tts_state
             )
             st["llm_streaming"] = False
+            if full_text and not st.get("cancel_requested"):
+                await websocket.send(json.dumps({
+                    "event": "assistant_emotion",
+                    "emotion": _extract_dialogue_emotion(full_text),
+                }, ensure_ascii=False))
 
             if full_text and tts_state["queued"] == 0:
                 fallback_tts = _extract_tts_text(full_text).strip()
@@ -1559,12 +1604,13 @@ class VoiceServer:
                 audio["url"] = ""
                 print("🧩 [LLM校验] 补齐停止音乐指令")
             else:
-                audio["command"] = "play"
-                query = user_text
-                audio["url"] = f"<search: {query}>"
+                existing_url = str(audio.get("url") or "").strip()
+                if audio.get("command") != "play" or not existing_url:
+                    audio["command"] = "play"
+                    audio["url"] = f"<search: {user_text}>"
+                    print("🧩 [LLM校验] 补齐本地选歌请求（单曲播放）")
                 audio["loop"] = False
                 audio.setdefault("volume", 60)
-                print("🧩 [LLM校验] 补齐本地选歌请求（单曲播放）")
 
         screen = action.setdefault("screen", {"command": "keep"})
         brightness_words = (
@@ -1618,7 +1664,7 @@ class VoiceServer:
             else:
                 audio["command"] = "keep"
                 audio["url"] = ""
-                print(f"⚠️ [{client_ip}] 本地曲库为空")
+                print(f"⚠️ [{client_ip}] 本地曲库未匹配到请求: {kw}")
         if audio.get("command") == "play":
             audio["loop"] = False
             audio["volume"] = max(20, min(60, MUSIC_PLAYBACK_VOLUME))

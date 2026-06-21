@@ -33,4 +33,7 @@ void lv_va_send_text_to_cloud(const char *text);
 /* 显示真实对话文本（用户语音识别结果 + AI 回复） */
 void lv_va_show_text(const char *user_text, const char *ai_text, const char *emotion);
 
+/* 只更新当前对话框主题色，不重启文字动画 */
+void lv_va_set_emotion(const char *emotion);
+
 #endif // LV_VOICE_ASSISTANT_H

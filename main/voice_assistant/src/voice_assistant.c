@@ -537,7 +537,12 @@ static void on_ws_event(const ws_voice_evt_t *evt, void *ctx) {
                 cJSON_Delete(root);
                 exit_dialogue_ex(false);
               } else {
-                if (text && text->valuestring) {
+                if (strcmp(event->valuestring, "assistant_emotion") == 0) {
+                  cJSON *emotion = cJSON_GetObjectItem(root, "emotion");
+                  if (emotion && emotion->valuestring) {
+                    lv_va_set_emotion(emotion->valuestring);
+                  }
+                } else if (text && text->valuestring) {
                   if (strcmp(event->valuestring, "asr_completed") == 0 ||
                       strcmp(event->valuestring, "asr_final") == 0) {
                     printf("\n🗣️  [ASR] %s\n", text->valuestring);

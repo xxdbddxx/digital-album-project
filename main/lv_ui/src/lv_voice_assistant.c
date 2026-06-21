@@ -47,6 +47,16 @@ static void lv_va_create_dialog(void);
 static void va_stop_ripple_anims(void);
 static void va_exit_timer_cb(lv_timer_t *t);
 
+static lv_color_t va_emotion_color(const char *emotion) {
+    if (emotion && strcmp(emotion, "empathic") == 0)
+        return lv_color_hex(0xFF8C42);
+    if (emotion && strcmp(emotion, "sad") == 0)
+        return lv_color_hex(0x5B9BD5);
+    if (emotion && strcmp(emotion, "happy") == 0)
+        return lv_color_hex(0xFFD700);
+    return lv_color_hex(0xFFFFFF);
+}
+
 /* ── CJK 字体文本净化器 ──
  * 问题根源：LVGL 字库仅含简体 CJK，当文本含 ASCII 空格(U+20) 或繁体字时，
  * 每帧都会疯狂输出 [Warn] glyph not found 日志洪水，拖垮串口和调度器。
@@ -534,14 +544,19 @@ void lv_va_show_text(const char *user_text, const char *ai_text, const char *emo
         typewriter_timer = lv_timer_create(typewriter_timer_cb, 50, ai_label);
     }
 
-    // 情绪驱动 UI 主题色
-    lv_color_t accent;
     if (emotion) {
-        if (strcmp(emotion, "empathic") == 0)      accent = lv_color_hex(0xFF8C42); // 暖橙
-        else if (strcmp(emotion, "sad") == 0)      accent = lv_color_hex(0x5B9BD5); // 冷蓝
-        else if (strcmp(emotion, "happy") == 0)    accent = lv_color_hex(0xFFD700); // 亮黄
-        else                                       accent = lv_color_hex(0xFFFFFF); // 白
-        lv_obj_set_style_border_color(dialog_box, accent, 0);
+        lv_obj_set_style_border_color(dialog_box, va_emotion_color(emotion), 0);
+    }
+    lvgl_port_unlock();
+}
+
+void lv_va_set_emotion(const char *emotion) {
+    if (!lvgl_port_lock(500)) {
+        ESP_LOGW("lv_va", "Failed to lock LVGL for set_emotion");
+        return;
+    }
+    if (dialog_box) {
+        lv_obj_set_style_border_color(dialog_box, va_emotion_color(emotion), 0);
     }
     lvgl_port_unlock();
 }

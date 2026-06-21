@@ -686,12 +686,16 @@ static esp_err_t voice_io_shared_init(uint32_t unused_rate) {
 
   init_fir_decim();
 
+  const aec_mode_t aec_mode = AEC_MODE_FD_LOW_COST;
+  const aec_nlp_level_t aec_nlp = AEC_NLP_LEVEL_NORMAL;
   if (aec_ref_ringbuf)
-    s_aec = aec_create(16000, 4, 1, AEC_MODE_SR_LOW_COST);
+    s_aec = aec_create(16000, 4, 1, aec_mode);
   if (s_aec) {
     s_aec_frame_samples = aec_get_chunksize(s_aec);
-    aec_set_nlp_level(s_aec, AEC_NLP_LEVEL_AGGR);
-    ESP_LOGI(TAG, "AEC initialized: frame=%d samples, volume=%u%%",
+    aec_set_nlp_level(s_aec, aec_nlp);
+    ESP_LOGI(TAG,
+             "AEC initialized: mode=%s, nlp=%s, frame=%d samples, volume=%u%%",
+             aec_get_mode_string(aec_mode), aec_get_nlp_string(aec_nlp),
              s_aec_frame_samples, s_spk_volume);
   } else {
     ESP_LOGW(TAG, "AEC/reference buffer unavailable; using processed PCM");
