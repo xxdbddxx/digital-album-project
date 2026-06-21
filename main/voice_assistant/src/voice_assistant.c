@@ -76,7 +76,7 @@ extern void ui_trigger_album_filter(const char *filter);
 #define VA_SAMPLE_RATE 16000 /* 统一采样率                        */
 #define VA_SILENCE_FRAMES 40 /* 语音后持续静音约 1.2s 时结束录音          */
 #define VA_SILENCE_FRAMES_EARLY                                                \
-  50 /* 录音<2s 时持续静音约 1.5s，避免短暂停顿截断句子 */
+  40 /* 录音<2s 时同样持续静音约 1.2s 后结束 */
 #define VA_RECORD_TIMEOUT_MS 10000 /* 连续模式无语音超时 10 秒          */
 #define VA_RESP_TIMEOUT_MS 60000   /* 等待 LLM 响应超时 60 秒           */
 #define VA_CMD_TIMEOUT_MS 5000     /* 命令等待超时                      */
@@ -84,7 +84,9 @@ extern void ui_trigger_album_filter(const char *filter);
 #define VA_INTERRUPT_MIN_PLAY_MS                                               \
   2000                            /* 避开 TTS 尾音和功放残留回声 */
 #define VA_TURN_RMS_THRESHOLD 1200 /* 倾听模式触发录音的最小 RMS 能量    */
-#define VA_RECORD_RMS_FLOOR 650   /* 自适应录音结束判定的最低 RMS 阈值  */
+#define VA_TURN_RMS_CEILING 6000   /* 连续对话自适应阈值上限            */
+#define VA_RECORD_RMS_FLOOR 1200   /* 自适应录音结束判定的最低 RMS 阈值  */
+#define VA_RECORD_RMS_CEILING 4000 /* 防止强语音让静音阈值抬得过高 */
 #define VA_WAKE_COOLDOWN_MS 2000  /* 唤醒词检测冷却时间，避免重复触发 */
 
 /* ── 内部状态枚举 ──────────────────────────────────────────── */
@@ -133,6 +135,12 @@ static bool g_continuous;           /* 是否处于连续对话模式           
 static bool g_user_spoke;           /* 本次录音中用户是否说过话          */
 static bool g_streaming;            /* 是否正在实时发送音频到服务器      */
 static int32_t g_record_peak_rms;   /* 本轮录音峰值，用于自适应静音判定  */
+static int32_t g_record_speech_rms_avg;
+static int32_t g_turn_rms_threshold = VA_TURN_RMS_THRESHOLD;
+static uint8_t g_audio_batch[4096];
+static int g_audio_batch_off;
+static uint32_t g_record_diag_frames;
+static bool g_reply_preview_received;
 static TickType_t g_rec_start_tick; /* 录音开始时刻（用于超时判断）      */
 static TickType_t g_last_ws_keepalive_tick; /* 上次 WS 保活心跳时刻 */
 static TickType_t g_resp_start_tick;     /* 等待 LLM 响应开始时刻             */
@@ -255,7 +263,7 @@ static void action_dispatch(cJSON *root) {
     const char *tts_str = (tts && tts->valuestring) ? tts->valuestring : "";
     const char *emo_str =
         (emotion && emotion->valuestring) ? emotion->valuestring : "neutral";
-    if (tts_str[0]) {
+    if (tts_str[0] && !g_reply_preview_received) {
       ESP_LOGI(TAG, "TTS text: %s", tts_str);
       lv_va_show_text(NULL, tts_str, emo_str);
     }
@@ -546,6 +554,16 @@ static void on_ws_event(const ws_voice_evt_t *evt, void *ctx) {
                      * 最终 CJSON 帧由 action_dispatch() 提取 dialogue.tts_text。
                      */
                   }
+                  else if (strcmp(event->valuestring, "assistant_reply") == 0) {
+                    cJSON *emotion =
+                        cJSON_GetObjectItem(root, "emotion");
+                    const char *emotion_str =
+                        (emotion && emotion->valuestring)
+                            ? emotion->valuestring
+                            : "neutral";
+                    g_reply_preview_received = true;
+                    lv_va_show_text(NULL, text->valuestring, emotion_str);
+                  }
                 }
                 action_dispatch(root);
                 cJSON_Delete(root);
@@ -597,6 +615,7 @@ static void on_ws_event(const ws_voice_evt_t *evt, void *ctx) {
  */
 static void enter_recording(const char *reason) {
   g_state = ST_RECORDING;
+  voice_io_set_mic_gain(12);
   voice_io_mic_clear();
   audio_buf_record_start(&g_ab);
   g_vad_speech = false;
@@ -607,6 +626,10 @@ static void enter_recording(const char *reason) {
   g_user_spoke = false;
   g_streaming = false;
   g_record_peak_rms = 0;
+  g_record_speech_rms_avg = 0;
+  g_audio_batch_off = 0;
+  g_record_diag_frames = 0;
+  g_reply_preview_received = false;
   g_rec_start_tick = 0;
   g_last_ws_keepalive_tick = xTaskGetTickCount();
 
@@ -641,6 +664,7 @@ static void exit_dialogue_ex(bool disconnect_ws) {
   /* 不再调用 g_wakenet->clean()，改为冷却期 + 唤醒后 clean 方案 */
 
   g_state = ST_WAITING_WAKEUP;
+  voice_io_set_mic_gain(24);
   g_wake_cooldown_end =
       xTaskGetTickCount() + pdMS_TO_TICKS(VA_WAKE_COOLDOWN_MS);
 
@@ -651,6 +675,8 @@ static void exit_dialogue_ex(bool disconnect_ws) {
   g_rec_start_tick = 0;
   g_vad_speech = false;
   g_vad_silence_cnt = 0;
+  g_audio_batch_off = 0;
+  g_record_diag_frames = 0;
 
   if (g_cb.on_state_change)
     g_cb.on_state_change(ST_WAITING_WAKEUP, g_cb.ctx);
@@ -950,6 +976,7 @@ void va_run(void) {
      */
     if (stream_player_is_playing() && g_state == ST_WAITING_TURN) {
       g_state = ST_WAITING_WAKEUP;
+      voice_io_set_mic_gain(24);
       g_wake_cooldown_end = 0;
       g_turn_speech_cnt = 0;
       if (g_cb.on_state_change)
@@ -1035,17 +1062,14 @@ void va_run(void) {
      *   - 连续模式超时（10 秒无语音）→ 退出对话
      * ======================================================== */
     case ST_RECORDING: {
-      static uint8_t s_batch[4096];
-      static int s_batch_off = 0;
-
       /* 预判: 下一帧能否塞进录音缓冲区？不能 → 自动结束录音 */
       int chunk_s = bytes_per_chunk / (int)sizeof(int16_t);
       if (!g_ab.recording || (g_ab.rec_len + chunk_s > g_ab.rec_buf_samples)) {
         if (g_ab.rec_len > 0) {
-          /* 先冲刷 s_batch 中未满 4096 字节的残留数据 */
-          if (s_batch_off > 0 && g_ws && ws_voice_is_connected(g_ws)) {
-            safe_send_binary(s_batch, s_batch_off, 1000);
-            s_batch_off = 0;
+          /* 先冲刷批处理缓冲中未满 4096 字节的残留数据 */
+          if (g_audio_batch_off > 0 && g_ws && ws_voice_is_connected(g_ws)) {
+            safe_send_binary(g_audio_batch, g_audio_batch_off, 1000);
+            g_audio_batch_off = 0;
           }
           audio_buf_record_stop(&g_ab);
           if (g_ws && ws_voice_is_connected(g_ws)) {
@@ -1070,15 +1094,17 @@ void va_run(void) {
        * 给服务器事件循环足够的喘息空间。
        */
       {
-        memcpy(s_batch + s_batch_off, (const uint8_t *)audio, bytes_per_chunk);
-        s_batch_off += bytes_per_chunk;
-        if (s_batch_off >= (int)sizeof(s_batch)) {
-          s_batch_off = 0;
+        memcpy(g_audio_batch + g_audio_batch_off, (const uint8_t *)audio,
+               bytes_per_chunk);
+        g_audio_batch_off += bytes_per_chunk;
+        if (g_audio_batch_off >= (int)sizeof(g_audio_batch)) {
+          g_audio_batch_off = 0;
           if (g_ws && ws_voice_is_connected(g_ws)) {
-            int sent = safe_send_binary(s_batch, sizeof(s_batch), 1000);
+            int sent =
+                safe_send_binary(g_audio_batch, sizeof(g_audio_batch), 1000);
             if (sent < 0) {
               ESP_LOGW(TAG, "Binary send failed (%d), exiting dialogue", sent);
-              s_batch_off = 0;
+              g_audio_batch_off = 0;
               audio_buf_record_stop(&g_ab);
               exit_dialogue();
               break;
@@ -1118,14 +1144,27 @@ void va_run(void) {
       if (g_vad) {
         vad_state_t vs = vad_process(g_vad, audio, VA_SAMPLE_RATE, 30);
         if (g_user_spoke) {
-          int32_t dynamic_silence = g_record_peak_rms / 6;
+          int32_t dynamic_silence = g_record_speech_rms_avg / 2;
           if (dynamic_silence < VA_RECORD_RMS_FLOOR)
             dynamic_silence = VA_RECORD_RMS_FLOOR;
-          if (frame_rms < dynamic_silence)
+          if (dynamic_silence > VA_RECORD_RMS_CEILING)
+            dynamic_silence = VA_RECORD_RMS_CEILING;
+          if (frame_rms <= dynamic_silence)
             vs = VAD_SILENCE;
+          if ((++g_record_diag_frames % 10) == 0) {
+            ESP_LOGI(TAG, "Endpoint RMS=%ld threshold=%ld silence=%d/40",
+                     (long)frame_rms, (long)dynamic_silence,
+                     g_vad_silence_cnt);
+          }
         }
         if (vs == VAD_SPEECH) {
           /* 检测到语音: 开始流式发送 */
+          if (g_record_speech_rms_avg == 0) {
+            g_record_speech_rms_avg = frame_rms;
+          } else if (frame_rms > g_record_speech_rms_avg) {
+            g_record_speech_rms_avg =
+                (g_record_speech_rms_avg * 7 + frame_rms) / 8;
+          }
           g_vad_speech = true;
           g_vad_silence_cnt = 0;
           g_user_spoke = true;
@@ -1152,10 +1191,11 @@ void va_run(void) {
 
             /* 录音足够长（>250ms）→ 已经实时发送完毕，只需发结束标记 */
             if (g_user_spoke && rec_len > (size_t)(VA_SAMPLE_RATE / 4)) {
-              /* 先冲刷 s_batch 中未满 4096 字节的残留数据 */
-              if (s_batch_off > 0 && g_ws && ws_voice_is_connected(g_ws)) {
-                safe_send_binary(s_batch, s_batch_off, 1000);
-                s_batch_off = 0;
+              /* 先冲刷批处理缓冲中未满 4096 字节的残留数据 */
+              if (g_audio_batch_off > 0 && g_ws &&
+                  ws_voice_is_connected(g_ws)) {
+                safe_send_binary(g_audio_batch, g_audio_batch_off, 1000);
+                g_audio_batch_off = 0;
               }
               if (g_ws && ws_voice_is_connected(g_ws)) {
                 safe_send_text("{\"event\":\"recording_ended\"}", 1000);
@@ -1165,7 +1205,7 @@ void va_run(void) {
               audio_buf_resp_begin(&g_ab);
             } else {
               /* 录音太短 → 取消，重新开始录音 */
-              s_batch_off = 0;
+              g_audio_batch_off = 0;
               if (g_ws && ws_voice_is_connected(g_ws))
                 ws_voice_send_text(g_ws, "{\"event\":\"recording_cancelled\"}",
                                    1000);
@@ -1234,6 +1274,7 @@ void va_run(void) {
             exit_dialogue_ex(false);
         } else if (stream_player_is_playing()) {
             g_state = ST_WAITING_WAKEUP;
+            voice_io_set_mic_gain(24);
             g_wake_cooldown_end = 0;
             g_turn_speech_cnt = 0;
             if (g_cb.on_state_change)
@@ -1241,12 +1282,21 @@ void va_run(void) {
             ESP_LOGI(TAG, "Music playing, WakeNet remains active");
         } else {
             /* TTS 播完 → 进入倾听模式，等待用户说下一句 */
+            g_turn_rms_threshold = g_record_speech_rms_avg * 3 / 5;
+            if (g_turn_rms_threshold < VA_TURN_RMS_THRESHOLD)
+              g_turn_rms_threshold = VA_TURN_RMS_THRESHOLD;
+            if (g_turn_rms_threshold > VA_TURN_RMS_CEILING)
+              g_turn_rms_threshold = VA_TURN_RMS_CEILING;
             g_state = ST_WAITING_TURN;
             g_turn_start_tick = xTaskGetTickCount();
             g_turn_speech_cnt = 0;
             if (g_vad)
               vad_reset_trigger(g_vad);
-            ESP_LOGI(TAG, "Listening for next turn...");
+            ESP_LOGI(TAG,
+                     "Listening for next turn (previous speech RMS=%ld, "
+                     "threshold=%ld)...",
+                     (long)g_record_speech_rms_avg,
+                     (long)g_turn_rms_threshold);
         }
       }
       break;
@@ -1290,14 +1340,14 @@ void va_run(void) {
 
         /* 实时 RMS：同一行刷新，不换行 */
         printf("\r[va] Listening RMS=%ld/%-6d", (long)rms,
-               VA_TURN_RMS_THRESHOLD);
+               (int)g_turn_rms_threshold);
         fflush(stdout);
 
         /* 三层过滤（对齐 ST_RECORDING 的判断强度）：
          *   ① RMS < 100 → 太弱，麦克风底噪，完全没声音
          *   ② VAD 非语音 → 重置计数
          *   ③ 连续 5 帧（150ms）语音 → 触发录音 */
-        if (rms < VA_TURN_RMS_THRESHOLD) {
+        if (rms < g_turn_rms_threshold) {
           g_turn_speech_cnt = 0;
         } else {
           vad_state_t vs = vad_process(g_vad, audio, VA_SAMPLE_RATE, 30);
@@ -1385,6 +1435,10 @@ void va_force_wake(void) {
  * UI 层用于暂停照片自动轮换。
  */
 bool va_is_active(void) { return g_state != ST_WAITING_WAKEUP; }
+
+bool va_is_network_critical(void) {
+  return g_state == ST_RECORDING || g_state == ST_WAITING_RESP;
+}
 
 esp_err_t voice_assistant_send_text(const char *text) {
   if (!text)

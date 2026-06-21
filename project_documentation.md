@@ -113,3 +113,69 @@
 即运行以下文件：
 1.  python backend/server.py
 2.  python backend/services/voice_server.py
+
+---
+
+## 五、2026-06-21 当前语音与媒体链路
+
+### 1. 当前处理链路
+
+```text
+INMP441
+-> WakeNet（你好小智）
+-> 设备端 VAD / 1.2 秒静音端点检测
+-> WebSocket 8888
+-> faster-whisper large-v3-turbo（CUDA float16）
+-> DeepSeek V4 Flash
+-> 阿里云 CosyVoice
+-> 16 kHz 单声道 PCM
+-> MAX98357A
+```
+
+- WebSocket 使用长连接，任务栈和传输缓冲均为 8192 字节。
+- 唤醒阶段麦克风输出增益为 24 倍，录音阶段为 12 倍。
+- AEC 使用线性麦克风数据，并在 I2S DMA 写入前排入音量缩放后的播放参考。
+- 用户停止说话后，设备根据稳定的语音能量参考累计约 1.2 秒静音并结束录音。
+- TTS 回复文本先发送到 ESP32，再生成和发送对应语音，保证对话框与语音同步开始。
+
+### 2. 连续对话
+
+- TTS 播放结束后进入等待下一轮状态。
+- 下一轮触发阈值参考上一轮真实语音平均 RMS，而不是仅使用固定环境音阈值。
+- 等待连续对话期间不阻塞设备命令轮询，照片和横竖屏控制可及时执行。
+- 播放音乐时使用 WakeNet 监听“你好小智”，允许用户中断音乐后继续对话。
+
+### 3. 音乐播放
+
+- 支持按文件名、歌曲标题和歌手元数据检索。
+- 明确指定但不存在的歌曲不会随机播放其他内容。
+- 仅在用户明确要求随机播放时随机选歌。
+- 音乐默认不循环，默认音量为 60%。
+- 后端将音乐转换为适合设备稳定播放的 16 kHz PCM 流。
+
+### 4. 网络资源调度
+
+- 录音和等待回复期间暂停照片后台 HTTP 请求，避免与语音 WebSocket 抢占内部网络内存。
+- 音乐播放期间降低设备心跳频率，并暂停命令和上传检查；音乐停止后立即恢复。
+- 等待连续对话不属于网络关键阶段，仍允许获取照片切换和方向控制命令。
+
+### 5. 启动、编译与密钥
+
+后端统一启动：
+
+```powershell
+.\restart_backend.bat
+```
+
+该脚本会关闭旧的专用后端 PowerShell 窗口及其子进程，再打开新的 Web Backend 和 Voice Backend 窗口。
+
+ESP-IDF 编译和烧录：
+
+```powershell
+.\scripts\idf.ps1 build
+.\scripts\idf.ps1 -p COM11 flash monitor
+```
+
+`scripts\idf.ps1` 固定使用 ESP-IDF v6.0.1，并强制单线程构建，避免 GCC 在 `esp_lcd_panel_rgb.c` 中出现内部崩溃。
+
+API 密钥仅保存在 `backend\.env.local`，该文件不得提交到 Git。

@@ -174,7 +174,7 @@ static void va_on_state_change(int state, void *ctx)
     // 映射 voice_assistant 状态机 → LVGL VA UI 状态
     // 0=ST_WAITING_WAKEUP  1=ST_RECORDING  2=ST_WAITING_RESP
     switch (state) {
-    case 0: /* 等待唤醒 → IDLE，UI 自动 EXIT */ break;
+    case 0: lv_va_show_state(LV_VA_STATE_EXIT); break;
     case 1: lv_va_show_state(LV_VA_STATE_LISTEN); break;
     case 2: lv_va_show_state(LV_VA_STATE_THINK); break;
     }

@@ -4,6 +4,8 @@ setlocal
 set "PROJECT_ROOT=%~dp0"
 set "BACKEND_DIR=%PROJECT_ROOT%backend"
 set "PYTHON_EXE=%BACKEND_DIR%\.venv\Scripts\python.exe"
+set "WEB_WINDOW=Digital Album - Web Backend"
+set "VOICE_WINDOW=Digital Album - Voice Backend"
 
 if not exist "%PYTHON_EXE%" (
     echo [ERROR] Backend Python not found:
@@ -12,7 +14,11 @@ if not exist "%PYTHON_EXE%" (
     exit /b 1
 )
 
-echo Stopping existing digital album backend processes...
+echo Closing existing backend PowerShell windows...
+taskkill /F /T /FI "WINDOWTITLE eq %WEB_WINDOW%*" >nul 2>&1
+taskkill /F /T /FI "WINDOWTITLE eq %VOICE_WINDOW%*" >nul 2>&1
+
+echo Stopping orphaned digital album backend processes...
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "$backend=[IO.Path]::GetFullPath('%BACKEND_DIR%');" ^
   "$targets=Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {" ^
@@ -26,10 +32,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "Start-Sleep -Milliseconds 800"
 
 echo Starting Flask backend on port 8765...
-start "Digital Album - Web Backend" /D "%BACKEND_DIR%" cmd.exe /k ""%PYTHON_EXE%" server.py"
+start "%WEB_WINDOW%" /D "%BACKEND_DIR%" powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$Host.UI.RawUI.WindowTitle='%WEB_WINDOW%'; & '%PYTHON_EXE%' 'server.py'"
 
 echo Starting voice backend on port 8888...
-start "Digital Album - Voice Backend" /D "%BACKEND_DIR%" cmd.exe /k ""%PYTHON_EXE%" services\voice_server.py"
+start "%VOICE_WINDOW%" /D "%BACKEND_DIR%" powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$Host.UI.RawUI.WindowTitle='%VOICE_WINDOW%'; & '%PYTHON_EXE%' 'services\voice_server.py'"
 
 echo.
 echo Backend restart completed.

@@ -75,6 +75,7 @@ static volatile uint32_t s_tx_pending_bytes = 0;
 
 static uint8_t s_spk_volume =
     60; // 全局硬件音量 (0~100)，语音和本地音频默认使用 60%
+static volatile uint8_t s_mic_gain = 24;
 
 static void tx_pending_add(size_t bytes) {
   __atomic_add_fetch(&s_tx_pending_bytes, (uint32_t)bytes, __ATOMIC_SEQ_CST);
@@ -127,6 +128,17 @@ void voice_io_set_spk_volume(uint8_t vol) {
 
 uint8_t voice_io_get_spk_volume(void) { return s_spk_volume; }
 
+void voice_io_set_mic_gain(uint8_t gain) {
+  if (gain < 1)
+    gain = 1;
+  if (gain > 24)
+    gain = 24;
+  s_mic_gain = gain;
+  ESP_LOGI(TAG, "Microphone output gain set to %ux", gain);
+}
+
+uint8_t voice_io_get_mic_gain(void) { return s_mic_gain; }
+
 static void aec_ref_read(int16_t *output, size_t sample_count) {
   size_t requested_bytes = sample_count * sizeof(int16_t);
   size_t received_bytes = 0;
@@ -156,6 +168,33 @@ static void aec_ref_clear(void) {
   void *item = NULL;
   while ((item = xRingbufferReceive(aec_ref_ringbuf, &item_size, 0)) != NULL)
     vRingbufferReturnItem(aec_ref_ringbuf, item);
+}
+
+static void mic_apply_output_gain(int16_t *samples, size_t sample_count) {
+  for (size_t i = 0; i < sample_count; i++) {
+    float amplified = (float)samples[i] * (float)s_mic_gain;
+    float norm = amplified / 32768.0f;
+    if (norm > 3.0f)
+      norm = 3.0f;
+    if (norm < -3.0f)
+      norm = -3.0f;
+    samples[i] = (int16_t)(tanhf(norm) * 32767.0f);
+  }
+}
+
+static void mic_update_output_metrics(const int16_t *samples,
+                                      size_t sample_count) {
+  uint64_t output_sum = 0;
+  uint32_t output_peak = 0;
+  for (size_t i = 0; i < sample_count; i++) {
+    uint32_t absolute = (uint32_t)abs(samples[i]);
+    output_sum += absolute;
+    if (absolute > output_peak)
+      output_peak = absolute;
+  }
+  s_mic_output_average =
+      sample_count ? (uint32_t)(output_sum / sample_count) : 0;
+  s_mic_output_peak = output_peak;
 }
 
 // FIR 滤波器所需资源
@@ -325,8 +364,8 @@ static void audio_rx_task(void *args) {
         if (mix_val > -100 && mix_val < 100) {
             pcm_48k_f[i] = 0.0f;
         } else {
-            // 对有效语音保持 24.0 倍放大，确保 WakeNet 能稳定唤醒，但不过度失真
-            pcm_48k_f[i] = (float)mix_val * 24.0f;
+            // Keep FIR/AEC input linear; state-specific gain is applied later.
+            pcm_48k_f[i] = (float)mix_val;
         }
       }
 
@@ -343,11 +382,9 @@ static void audio_rx_task(void *args) {
 
       // 4. 浮点转回 16-bit PCM（tanh 软限制，避免硬切爆破音）
 
-      uint64_t output_sum = 0;
-      uint32_t output_peak = 0;
       for (int i = 0; i < AUDIO_CHUNK_SAMPLES / 3; i++) {
 
-        float val = pcm_16k_f[i];
+        float linear = pcm_16k_f[i];
         // tanh 软限制三步曲：
         //   1) 归一化：val / 32768  →  将 ±32768 映射到 ±1.0
         //   2) tanh 压缩：tanh(norm)  →  小信号近似线性通过，
@@ -355,25 +392,16 @@ static void audio_rx_task(void *args) {
         //   3) 还原：×32767  →  回到 int16 满量程范围
         // 对比硬切：原来 >32767 直接截断，产生高频咔哒声；
         //           现在 tanh 平滑过渡，波形连续，无爆破音
-        float norm = val / 32768.0f;
-        if (norm > 3.0f)
-          norm = 3.0f; // tanh(3) ≈ 0.995，已接近饱和
-        if (norm < -3.0f)
-          norm = -3.0f;
-        float limited = tanhf(norm) * 32767.0f;
-        pcm_16k_buf[i] = (int16_t)limited;
-        uint32_t abs_output = (uint32_t)abs(pcm_16k_buf[i]);
-        output_sum += abs_output;
-        if (abs_output > output_peak)
-          output_peak = abs_output;
+        if (linear > 32767.0f)
+          linear = 32767.0f;
+        if (linear < -32768.0f)
+          linear = -32768.0f;
+        pcm_16k_buf[i] = (int16_t)linear;
       }
 
       s_mic_left_average = (uint32_t)(l_sum / AUDIO_CHUNK_SAMPLES);
       s_mic_right_average = (uint32_t)(r_sum / AUDIO_CHUNK_SAMPLES);
       s_mic_input_peak = input_peak;
-      s_mic_output_average =
-          (uint32_t)(output_sum / (AUDIO_CHUNK_SAMPLES / 3));
-      s_mic_output_peak = output_peak;
       s_mic_frame_count++;
 
       // 5. 送入 PSRAM 缓冲池，让上层网络慢慢消费
@@ -382,6 +410,8 @@ static void audio_rx_task(void *args) {
       if (!s_aec || !s_amp_enabled) {
         aec_frame_fill = 0;
         aec_ref_clear();
+        mic_apply_output_gain(pcm_16k_buf, chunk_samples);
+        mic_update_output_metrics(pcm_16k_buf, chunk_samples);
         xRingbufferSend(rx_ringbuf, pcm_16k_buf,
                         chunk_samples * sizeof(int16_t), 0);
         continue;
@@ -404,6 +434,8 @@ static void audio_rx_task(void *args) {
 
         if (aec_frame_fill == s_aec_frame_samples) {
           aec_process(s_aec, aec_mic_frame, aec_ref_frame, aec_out_frame);
+          mic_apply_output_gain(aec_out_frame, s_aec_frame_samples);
+          mic_update_output_metrics(aec_out_frame, s_aec_frame_samples);
           xRingbufferSend(rx_ringbuf, aec_out_frame,
                           s_aec_frame_samples * sizeof(int16_t), 0);
           aec_frame_fill = 0;
@@ -550,6 +582,16 @@ static void audio_tx_task(void *args) {
 
       if (sample_cnt > 0) {
 
+        /*
+         * Queue the exact volume-scaled playback reference before submitting
+         * the samples to I2S. The acoustic path reaches the microphone later,
+         * giving AEC a correctly ordered far-end reference.
+         */
+        if (aec_ref_ringbuf) {
+          xRingbufferSend(aec_ref_ringbuf, aec_ref_buf,
+                          sample_cnt * sizeof(int16_t), 0);
+        }
+
         size_t bytes_written = 0;
 
         esp_err_t err = i2s_channel_write(tx_chan, upmix_buf, sample_cnt * 24,
@@ -565,9 +607,6 @@ static void audio_tx_task(void *args) {
             ESP_LOGW(TAG, "I2S DMA Write Failed (%lu): %s",
                      (unsigned long)i2s_err_count, esp_err_to_name(err));
           }
-        } else if (aec_ref_ringbuf) {
-          xRingbufferSend(aec_ref_ringbuf, aec_ref_buf,
-                          sample_cnt * sizeof(int16_t), 0);
         }
 
         total_samples_tx += sample_cnt;

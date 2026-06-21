@@ -93,6 +93,8 @@ typedef struct {
  * 获取最近一帧麦克风旁路统计，不消费 WakeNet/ASR 使用的录音数据。
  */
 esp_err_t voice_io_mic_get_metrics(voice_io_mic_metrics_t *metrics);
+void voice_io_set_mic_gain(uint8_t gain);
+uint8_t voice_io_get_mic_gain(void);
 
 /* ── 扬声器 API ─────────────────────────────────────────────── */
 

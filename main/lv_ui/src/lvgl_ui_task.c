@@ -253,6 +253,20 @@ static void upload_check_task(void *param) {
     if (!net_mgr_is_connected()) {
       continue;
     }
+    loop_cnt++;
+
+    /*
+     * Voice streaming needs exclusive access to the small internal network
+     * heap. Music keeps only a low-rate heartbeat; command and upload polling
+     * resume immediately after playback stops.
+     */
+    if (va_is_network_critical()) {
+      continue;
+    }
+    bool music_playing = stream_player_is_playing();
+    if (music_playing && (loop_cnt % 10) != 0) {
+      continue;
+    }
 
     // ========== 1. 心跳与状态上报 ==========
     int aroma_states[3] = {aroma_get_state(AROMA_CH_1),
@@ -268,6 +282,9 @@ static void upload_check_task(void *param) {
       current_id = g_photos[g_current_idx].id;
     }
     photo_client_send_heartbeat(current_id, fps, free_mem, aroma_states);
+    if (music_playing) {
+      continue;
+    }
 
     // ========== 2. 拉取遥控指令 ==========
     device_command_t cmd;
@@ -336,7 +353,6 @@ static void upload_check_task(void *param) {
       }
     }
 
-    loop_cnt++;
     if ((loop_cnt % 30) == 0) {
       ESP_LOGI(TAG, "net_daemon alive, stack high-water=%u bytes",
                (unsigned)uxTaskGetStackHighWaterMark(NULL));

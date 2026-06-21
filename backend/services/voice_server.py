@@ -911,12 +911,19 @@ class VoiceServer:
             
             async def tts_consumer():
                 st["tts_generating"] = True
+                display_text = ""
                 while True:
                     sentence = await tts_queue.get()
                     if sentence is None:
                         await pcm_queue.put(None)
                         break
                     if sentence.strip() and not st.get("cancel_requested"):
+                        display_text += sentence
+                        await websocket.send(json.dumps({
+                            "event": "assistant_reply",
+                            "text": display_text,
+                            "emotion": "neutral",
+                        }, ensure_ascii=False))
                         pcm_res = await asyncio.to_thread(
                             self._generate_tts_audio_only, sentence, client_ip
                         )

@@ -140,6 +140,13 @@ void va_force_wake(void);
 bool va_is_active(void);
 
 /**
+ * @brief 查询语音链路是否正在占用大量网络资源。
+ *
+ * 等待连续对话时返回 false，允许设备及时拉取照片和方向控制命令。
+ */
+bool va_is_network_critical(void);
+
+/**
  * @brief 发送文本消息到语音助手 WebSocket 连接中（线程安全）
  */
 esp_err_t voice_assistant_send_text(const char *text);

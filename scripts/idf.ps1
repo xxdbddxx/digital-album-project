@@ -24,6 +24,7 @@ foreach ($path in $requiredPaths) {
 $env:IDF_PATH = $IdfPath
 $env:IDF_TOOLS_PATH = $IdfToolsPath
 $env:IDF_PYTHON_ENV_PATH = $IdfPythonEnv
+$env:CMAKE_BUILD_PARALLEL_LEVEL = "1"
 $env:PATH = "$PythonHome;$(Join-Path $PythonHome 'Scripts');$env:PATH"
 
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
