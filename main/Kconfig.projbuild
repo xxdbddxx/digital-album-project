@@ -165,30 +165,30 @@ menu "Voice Assistant"
     menu "I2S Microphone (INMP441)"
         config VA_MIC_WS_PIN
             int "MIC WS (LRCLK) GPIO"
-            default 11
+            default 12
             range 0 48
         config VA_MIC_SCK_PIN
             int "MIC SCK (BCLK) GPIO"
-            default 12
+            default 11
             range 0 48
         config VA_MIC_SD_PIN
             int "MIC SD (DATA) GPIO"
-            default 6
+            default 13
             range 0 48
     endmenu
 
     menu "I2S Speaker (MAX98357A)"
         config VA_SPK_BCLK_PIN
             int "SPK BCLK GPIO"
-            default 12
+            default 11
             range 0 48
         config VA_SPK_LRCK_PIN
             int "SPK LRCLK GPIO"
-            default 11
+            default 12
             range 0 48
         config VA_SPK_DIN_PIN
             int "SPK DIN GPIO"
-            default 13
+            default 6
             range 0 48
         config VA_SPK_SD_PIN
             int "SPK SD (Shutdown) GPIO"
@@ -196,6 +196,19 @@ menu "Voice Assistant"
             range -1 48
             help
                 MAX98357A SD_MODE pin. Set to -1 to keep the amplifier always on and disable GPIO control.
+
+        config VA_AUTO_SPK_TEST
+            bool "Play a 440Hz speaker test after startup"
+            default n
+            help
+                Play a local 440Hz tone after startup and stop automatically.
+                This does not require Wi-Fi, the backend, a microphone, or an API.
+
+        config VA_AUTO_SPK_TEST_DURATION_MS
+            int "Automatic speaker test duration (ms)"
+            depends on VA_AUTO_SPK_TEST
+            default 5000
+            range 1000 30000
     endmenu
 
 endmenu

@@ -25,6 +25,11 @@ import datetime as dt
 import queue
 import threading
 import os
+import re
+import math
+import hashlib
+import shutil
+import subprocess
 from io import BytesIO
 from PIL import Image, ImageOps, ImageFilter
 import requests
@@ -38,6 +43,7 @@ DOWNLOAD_KEY = str(getattr(cfg, "DOWNLOAD_KEY", "") or "").strip()
 UPLOAD_PASSWORD = str(getattr(cfg, "UPLOAD_PASSWORD", "") or "").strip()
 GEMINI_API_KEY = str(getattr(cfg, "GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "") or "").strip()
 GEMINI_VISION_MODEL = str(getattr(cfg, "GEMINI_VISION_MODEL", "") or os.environ.get("GEMINI_VISION_MODEL", "") or "gemini-2.5-flash-lite").strip()
+GEMINI_EMBEDDING_MODEL = str(getattr(cfg, "GEMINI_EMBEDDING_MODEL", "") or os.environ.get("GEMINI_EMBEDDING_MODEL", "") or "gemini-embedding-2").strip()
 ENABLE_GEMINI_CAPTION = bool(getattr(cfg, "ENABLE_GEMINI_CAPTION", True))
 DISPLAY_ORIENTATION_DEFAULT = str(getattr(cfg, "DISPLAY_ORIENTATION_DEFAULT", "landscape") or "landscape").strip().lower()
 
@@ -81,8 +87,19 @@ DEVICE_STATE = {
     "desired_orientation": "portrait" if DISPLAY_ORIENTATION_DEFAULT == "portrait" else "landscape",
     "reported_orientation": "portrait" if DISPLAY_ORIENTATION_DEFAULT == "portrait" else "landscape",
     "aroma_channels": [0, 0, 0],
-    "pending_command": None
+    "pending_commands": []
 }
+_DEVICE_COMMAND_LOCK = threading.Lock()
+
+def _queue_device_command(command: dict) -> None:
+    with _DEVICE_COMMAND_LOCK:
+        queue_items = DEVICE_STATE["pending_commands"]
+        if command.get("cmd") in {"set_orientation", "switch_photo", "set_view"}:
+            queue_items[:] = [
+                item for item in queue_items
+                if item.get("cmd") not in {"set_orientation", "switch_photo", "set_view"}
+            ]
+        queue_items.append(command)
 
 # SSE 事件队列：voice_server 回调 → Web 前端实时推送
 _SSE_SUBSCRIBERS: list[queue.Queue] = []
@@ -138,9 +155,37 @@ def _init_databases():
             source_ref TEXT,
             target_date TEXT,
             created_at TEXT,
-            hidden INTEGER DEFAULT 0
+            hidden INTEGER DEFAULT 0,
+            tags TEXT DEFAULT '',
+            taken_at TEXT DEFAULT '',
+            city TEXT DEFAULT '',
+            embedding_json TEXT DEFAULT '',
+            embedding_hash TEXT DEFAULT '',
+            embedding_model TEXT DEFAULT ''
         )
     """)
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(device_photos)").fetchall()
+    }
+    for column, definition in {
+        "tags": "TEXT DEFAULT ''",
+        "taken_at": "TEXT DEFAULT ''",
+        "city": "TEXT DEFAULT ''",
+        "embedding_json": "TEXT DEFAULT ''",
+        "embedding_hash": "TEXT DEFAULT ''",
+        "embedding_model": "TEXT DEFAULT ''",
+    }.items():
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE device_photos ADD COLUMN {column} {definition}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_device_photos_hidden ON device_photos(hidden)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_device_photos_target_date ON device_photos(target_date)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_device_photos_source_type ON device_photos(source_type)"
+    )
     conn.commit()
     conn.close()
 
@@ -161,18 +206,240 @@ def _init_databases():
 
 _init_databases()
 
+def _normalize_tags(value) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        raw_tags = [str(item) for item in value]
+    else:
+        raw_tags = re.split(r"[,，;；、\n]+", str(value or ""))
+
+    result = []
+    seen = set()
+    for raw_tag in raw_tags:
+        tag = re.sub(r"\s+", " ", raw_tag).strip()
+        key = tag.casefold()
+        if not tag or key in {"none", "null", "undefined"} or key in seen:
+            continue
+        seen.add(key)
+        result.append(tag[:32])
+        if len(result) >= 24:
+            break
+    return result
+
+def _serialize_tags(value) -> str:
+    return ",".join(_normalize_tags(value))
+
+def _metadata_date(meta: dict, fallback: str = "") -> str:
+    candidates = [str(meta.get("exif_datetime") or "")]
+    try:
+        exif_data = json.loads(meta.get("exif_json") or "{}")
+        candidates.append(str(exif_data.get("datetime") or ""))
+    except (TypeError, ValueError):
+        pass
+    for value in candidates:
+        match = re.search(r"(\d{4})[:\-](\d{2})[:\-](\d{2})", value)
+        if match:
+            return "-".join(match.groups())
+    return fallback
+
+def _season_tag(date_value: str) -> str:
+    match = re.search(r"\d{4}-(\d{2})-\d{2}", date_value or "")
+    if not match:
+        return ""
+    month = int(match.group(1))
+    if month in (3, 4, 5):
+        return "春天"
+    if month in (6, 7, 8):
+        return "夏天"
+    if month in (9, 10, 11):
+        return "秋天"
+    return "冬天"
+
+def _build_photo_tags(
+    *,
+    explicit_tags="",
+    date_value: str = "",
+    city: str = "",
+    source_type: str = "",
+    photo_type: str = "",
+) -> str:
+    tags = _normalize_tags(explicit_tags)
+    date_match = re.search(r"(\d{4})-(\d{2})-\d{2}", date_value or "")
+    if date_match:
+        year, month = date_match.groups()
+        tags.extend([f"{year}年", f"{year}-{month}", f"{int(month)}月"])
+        season = _season_tag(date_value)
+        if season:
+            tags.append(season)
+    if city:
+        tags.append(city)
+    if photo_type:
+        tags.append(photo_type)
+    if source_type == "upload":
+        tags.append("上传")
+    elif source_type == "output":
+        tags.append("本地图库")
+    return _serialize_tags(tags)
+
+def _strip_derived_tags(value, city: str = "") -> list[str]:
+    derived = {"春天", "夏天", "秋天", "冬天", "上传", "本地图库"}
+    if city:
+        derived.add(city)
+    result = []
+    for tag in _normalize_tags(value):
+        if tag in derived:
+            continue
+        if re.fullmatch(r"\d{4}年|\d{4}-\d{2}|\d{1,2}月", tag):
+            continue
+        result.append(tag)
+    return result
+
+def _photo_embedding_text(photo: dict) -> str:
+    tags = "、".join(_normalize_tags(photo.get("tags")))
+    parts = [
+        f"照片标题：{photo.get('caption') or photo.get('id') or '未命名'}",
+        f"标签：{tags or '无'}",
+        f"拍摄日期：{photo.get('taken_at') or photo.get('target_date') or '未知'}",
+        f"地点：{photo.get('city') or '未知'}",
+        f"来源：{photo.get('source_type') or '未知'}",
+    ]
+    return "；".join(parts)
+
+def _embedding_content_hash(photo: dict) -> str:
+    return hashlib.sha256(_photo_embedding_text(photo).encode("utf-8")).hexdigest()
+
+def _gemini_embedding(text: str, *, is_query: bool) -> list[float]:
+    if not GEMINI_API_KEY:
+        raise GeminiAnalysisError("Gemini API 未配置")
+    prefix = (
+        f"task: search result | query: {text}"
+        if is_query
+        else f"title: photo | text: {text}"
+    )
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_EMBEDDING_MODEL}:embedContent"
+    )
+    payload = {
+        "content": {"parts": [{"text": prefix}]},
+        "output_dimensionality": 768,
+    }
+    last_error = "Gemini 向量接口未返回有效结果"
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                url,
+                params={"key": GEMINI_API_KEY},
+                json=payload,
+                timeout=30,
+            )
+            if resp.ok:
+                values = (resp.json().get("embedding") or {}).get("values") or []
+                if values:
+                    return [float(value) for value in values]
+                last_error = "Gemini 向量接口返回空向量"
+            else:
+                last_error = _gemini_error_message(resp)
+        except requests.Timeout:
+            last_error = "Gemini 向量请求超时"
+        except requests.RequestException as exc:
+            last_error = f"Gemini 向量网络请求失败: {exc}"
+        if attempt == 0:
+            time.sleep(1.2)
+    raise GeminiAnalysisError(last_error)
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or len(left) != len(right):
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+def _refresh_photo_embedding(photo: dict, *, force: bool = False) -> bool:
+    content_hash = _embedding_content_hash(photo)
+    if (
+        not force
+        and photo.get("embedding_json")
+        and photo.get("embedding_hash") == content_hash
+        and photo.get("embedding_model") == GEMINI_EMBEDDING_MODEL
+    ):
+        return False
+    vector = _gemini_embedding(_photo_embedding_text(photo), is_query=False)
+    conn = sqlite3.connect(str(UPLOAD_DB_PATH))
+    conn.execute(
+        """
+        UPDATE device_photos
+        SET embedding_json = ?, embedding_hash = ?, embedding_model = ?
+        WHERE id = ?
+        """,
+        (
+            json.dumps(vector, separators=(",", ":")),
+            content_hash,
+            GEMINI_EMBEDDING_MODEL,
+            photo["id"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+def _semantic_search_device_photos(
+    query: str,
+    limit: int = 5,
+    min_score: float = 0.55,
+    max_score_gap: float = 0.10,
+    adjacent_score_gap: float = 0.06,
+) -> list[dict]:
+    query_vector = _gemini_embedding(query, is_query=True)
+    rows = _load_device_photos(include_hidden=False, limit=None)
+    matches = []
+    for photo in rows:
+        if not photo.get("embedding_json"):
+            continue
+        try:
+            vector = json.loads(photo["embedding_json"])
+        except (TypeError, ValueError):
+            continue
+        score = _cosine_similarity(query_vector, vector)
+        matches.append({**photo, "semantic_score": round(score, 6)})
+    matches.sort(key=lambda item: item["semantic_score"], reverse=True)
+    if not matches:
+        return []
+
+    top_score = matches[0]["semantic_score"]
+    adaptive_threshold = max(min_score, top_score - max_score_gap)
+    relevant = []
+    previous_score = None
+    for photo in matches:
+        score = photo["semantic_score"]
+        if score < adaptive_threshold:
+            break
+        if previous_score is not None and previous_score - score >= adjacent_score_gap:
+            break
+        relevant.append(photo)
+        previous_score = score
+    return relevant[:max(1, min(int(limit), 20))]
+
 def _photo_score_by_id(photo_id: str) -> dict:
     if not DB_PATH.exists():
         return {}
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    row = conn.execute("""
-        SELECT path, side_caption, caption, exif_json, exif_city
+    rows = conn.execute("""
+        SELECT path, side_caption, caption, exif_json, exif_datetime,
+               exif_city, tags, type, reason
         FROM photo_scores
         WHERE path LIKE ?
-        LIMIT 1
-    """, (f"%{photo_id}%",)).fetchone()
+    """, (f"%{photo_id}%",)).fetchall()
     conn.close()
+    if not rows:
+        return {}
+    row = next(
+        (candidate for candidate in rows if Path(candidate["path"]).stem == photo_id),
+        None,
+    )
     return dict(row) if row else {}
 
 def _sync_device_library_from_output() -> None:
@@ -182,17 +449,29 @@ def _sync_device_library_from_output() -> None:
         preview_path = BIN_OUTPUT_DIR / f"preview_{photo_id}.jpg"
         meta = _photo_score_by_id(photo_id)
         caption = meta.get("side_caption") or meta.get("caption") or photo_id
-        date_str = dt.date.today().isoformat()
+        date_str = _metadata_date(meta, dt.date.today().isoformat())
+        city = str(meta.get("exif_city") or "").strip()
+        tags = _build_photo_tags(
+            explicit_tags=meta.get("tags"),
+            date_value=date_str,
+            city=city,
+            source_type="output",
+            photo_type=str(meta.get("type") or "").strip(),
+        )
         conn.execute("""
             INSERT INTO device_photos
                 (id, rgb565_path, preview_path, caption, uploader_name,
-                 source_type, source_ref, target_date, created_at, hidden)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), 0)
+                 source_type, source_ref, target_date, created_at, hidden,
+                 tags, taken_at, city)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), 0, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 rgb565_path = excluded.rgb565_path,
                 preview_path = excluded.preview_path,
                 caption = COALESCE(NULLIF(device_photos.caption, ''), excluded.caption),
-                target_date = COALESCE(NULLIF(device_photos.target_date, ''), excluded.target_date)
+                target_date = COALESCE(NULLIF(device_photos.target_date, ''), excluded.target_date),
+                tags = COALESCE(NULLIF(device_photos.tags, ''), excluded.tags),
+                taken_at = COALESCE(NULLIF(device_photos.taken_at, ''), excluded.taken_at),
+                city = COALESCE(NULLIF(device_photos.city, ''), excluded.city)
         """, (
             photo_id,
             str(rgb565_path),
@@ -202,6 +481,9 @@ def _sync_device_library_from_output() -> None:
             "output",
             photo_id,
             date_str,
+            tags,
+            date_str,
+            city,
         ))
     conn.row_factory = sqlite3.Row
     upload_rows = conn.execute("""
@@ -211,17 +493,22 @@ def _sync_device_library_from_output() -> None:
     for row in upload_rows:
         upload_id = row["id"]
         preview_path = UPLOAD_DIR / f"{upload_id}_preview.jpg"
+        date_str = row["target_date"] or dt.date.today().isoformat()
+        tags = _build_photo_tags(date_value=date_str, source_type="upload")
         conn.execute("""
             INSERT INTO device_photos
                 (id, rgb565_path, preview_path, caption, uploader_name,
-                 source_type, source_ref, target_date, created_at, hidden)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                 source_type, source_ref, target_date, created_at, hidden,
+                 tags, taken_at, city)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, '')
             ON CONFLICT(id) DO UPDATE SET
                 rgb565_path = excluded.rgb565_path,
                 preview_path = excluded.preview_path,
                 caption = COALESCE(NULLIF(device_photos.caption, ''), excluded.caption),
                 uploader_name = COALESCE(NULLIF(device_photos.uploader_name, ''), excluded.uploader_name),
-                target_date = COALESCE(NULLIF(device_photos.target_date, ''), excluded.target_date)
+                target_date = COALESCE(NULLIF(device_photos.target_date, ''), excluded.target_date),
+                tags = COALESCE(NULLIF(device_photos.tags, ''), excluded.tags),
+                taken_at = COALESCE(NULLIF(device_photos.taken_at, ''), excluded.taken_at)
         """, (
             f"upload_{upload_id}",
             row["rgb565_path"],
@@ -230,8 +517,10 @@ def _sync_device_library_from_output() -> None:
             row["uploader_name"] or "上传",
             "upload",
             upload_id,
-            row["target_date"] or dt.date.today().isoformat(),
+            date_str,
             row["created_at"] or dt.datetime.now().isoformat(sep=" ", timespec="seconds"),
+            tags,
+            date_str,
         ))
     conn.commit()
     conn.close()
@@ -408,7 +697,12 @@ def api_device_status():
         "reported_orientation": DEVICE_STATE["reported_orientation"],
         "orientation_synced": DEVICE_STATE["desired_orientation"] == DEVICE_STATE["reported_orientation"],
         "aroma_channels": DEVICE_STATE["aroma_channels"],
-        "pending_command": DEVICE_STATE["pending_command"]
+        "pending_command": (
+            DEVICE_STATE["pending_commands"][0]
+            if DEVICE_STATE["pending_commands"]
+            else None
+        ),
+        "pending_command_count": len(DEVICE_STATE["pending_commands"]),
     })
 
 @app.route("/api/device/control", methods=["POST"])
@@ -416,20 +710,51 @@ def api_device_control():
     data = request.json or {}
     cmd = data.get("cmd")
     if cmd == "switch_photo":
-        DEVICE_STATE["pending_command"] = {"cmd": "switch_photo", "target_id": data.get("target_id", "next")}
+        _queue_device_command({
+            "cmd": "switch_photo",
+            "target_id": data.get("target_id", "next"),
+        })
     elif cmd == "toggle_aroma":
-        DEVICE_STATE["pending_command"] = {"cmd": "toggle_aroma", "channel": data.get("channel", 0), "state": data.get("state", 1)}
+        _queue_device_command({
+            "cmd": "toggle_aroma",
+            "channel": data.get("channel", 0),
+            "state": data.get("state", 1),
+        })
     elif cmd == "set_orientation":
         orientation = _normalize_orientation(data.get("orientation"))
         DEVICE_STATE["desired_orientation"] = orientation
-        DEVICE_STATE["pending_command"] = {"cmd": "set_orientation", "orientation": orientation}
+        _queue_device_command({
+            "cmd": "set_orientation",
+            "orientation": orientation,
+        })
+    elif cmd == "set_view":
+        target_id = str(data.get("target_id") or "").strip()[:63]
+        orientation_value = str(data.get("orientation") or "keep").strip().lower()
+        orientation = (
+            "keep"
+            if orientation_value == "keep"
+            else _normalize_orientation(orientation_value)
+        )
+        if orientation != "keep":
+            DEVICE_STATE["desired_orientation"] = orientation
+        _queue_device_command({
+            "cmd": "set_view",
+            "target_id": target_id,
+            "orientation": orientation,
+        })
+    else:
+        return jsonify({"ok": False, "error": "unsupported command"}), 400
     return jsonify({"ok": True})
 
 @app.route("/api/device/command", methods=["GET"])
 def api_device_command():
     # 给 ESP32 用的接口，获取后自动清空
-    cmd = DEVICE_STATE["pending_command"]
-    DEVICE_STATE["pending_command"] = None
+    with _DEVICE_COMMAND_LOCK:
+        cmd = (
+            DEVICE_STATE["pending_commands"].pop(0)
+            if DEVICE_STATE["pending_commands"]
+            else None
+        )
     return jsonify({"command": cmd})
 
 # API: 智能交互审计与情感联络
@@ -520,6 +845,26 @@ def api_internal_llm_reply():
     
     # SSE 广播
     _sse_push({"type": "ai_reply", "reply": reply_text})
+    return jsonify({"ok": True})
+
+@app.route("/api/internal/asr_text", methods=["POST"])
+def api_internal_asr_text():
+    """接收 ESP32 物理麦克风的 ASR 文本并同步到 Web UI。"""
+    data = request.json or {}
+    user_text = data.get("text", "").strip()
+    if not user_text:
+        return jsonify({"ok": False, "error": "空文本"})
+
+    conn = sqlite3.connect(str(UPLOAD_DB_PATH))
+    conn.execute(
+        "INSERT INTO dialog_history (sender, content, created_at) "
+        "VALUES (?, ?, datetime('now', 'localtime'))",
+        ("user", user_text),
+    )
+    conn.commit()
+    conn.close()
+
+    _sse_push({"type": "user_message", "text": user_text})
     return jsonify({"ok": True})
 
 @app.route("/api/dialogs/history", methods=["GET"])
@@ -659,29 +1004,182 @@ def images(subpath: str):
 
 @app.get("/music/<path:subpath>")
 def music(subpath: str):
-    # 提供 MP3 流媒体服务
+    # 提供音乐流媒体服务。PCM 缓存缺失时由同名 MP3 首次生成。
+    # ESP32 串口按键 6 固定请求 test.mp3，将其映射到节奏清晰的功放测试曲。
+    if subpath == "test.mp3":
+        subpath = "happy_pop_1.mp3"
     filepath = ROOT_DIR / "music" / subpath
+    if not filepath.is_file() and subpath.endswith("_16k_mono.pcm"):
+        source_name = subpath.removesuffix("_16k_mono.pcm") + ".mp3"
+        source_path = ROOT_DIR / "music" / source_name
+        ffmpeg = shutil.which("ffmpeg")
+        if source_path.is_file() and ffmpeg:
+            temp_path = filepath.with_suffix(".pcm.tmp")
+            try:
+                subprocess.run(
+                    [
+                        ffmpeg, "-y", "-i", str(source_path),
+                        "-f", "s16le", "-ar", "16000", "-ac", "1",
+                        str(temp_path),
+                    ],
+                    capture_output=True,
+                    timeout=120,
+                    check=True,
+                )
+                temp_path.replace(filepath)
+            except (OSError, subprocess.SubprocessError):
+                temp_path.unlink(missing_ok=True)
     if not filepath.is_file(): abort(404)
-    return send_file(str(filepath))
+    mimetype = (
+        "application/octet-stream"
+        if filepath.suffix.lower() == ".pcm"
+        else None
+    )
+    return send_file(str(filepath), mimetype=mimetype)
+
+@app.get("/music-stream/<path:subpath>")
+def music_stream(subpath: str):
+    """Transcode an MP3 to 16 kHz mono PCM while streaming it to the ESP32."""
+    music_root = (ROOT_DIR / "music").resolve()
+    if not subpath.lower().endswith(".pcm"):
+        abort(404)
+    source_name = subpath[:-4] + ".mp3"
+    source_path = (music_root / source_name).resolve()
+    try:
+        source_path.relative_to(music_root)
+    except ValueError:
+        abort(404)
+    if not source_path.is_file():
+        abort(404)
+
+    def generate_pcm():
+        import av
+
+        container = av.open(str(source_path))
+        resampler = av.AudioResampler(
+            format="s16",
+            layout="mono",
+            rate=16000,
+        )
+        pending = bytearray()
+
+        def append_frames(frames):
+            for output_frame in frames:
+                pending.extend(
+                    output_frame.to_ndarray()
+                    .astype("<i2", copy=False)
+                    .tobytes()
+                )
+
+        try:
+            for frame in container.decode(audio=0):
+                converted = resampler.resample(frame)
+                if converted is None:
+                    continue
+                frames = converted if isinstance(converted, list) else [converted]
+                append_frames(frames)
+                while len(pending) >= 16384:
+                    yield bytes(pending[:16384])
+                    del pending[:16384]
+
+            flushed = resampler.resample(None)
+            if flushed:
+                frames = flushed if isinstance(flushed, list) else [flushed]
+                append_frames(frames)
+            if pending:
+                yield bytes(pending)
+        finally:
+            container.close()
+
+    return Response(
+        generate_pcm(),
+        mimetype="application/octet-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Audio-Format": "s16le;rate=16000;channels=1",
+        },
+    )
 
 # ESP32 核心依赖接口（保持原样兼容）
-def _load_device_photos(include_hidden: bool = False, limit: int | None = None) -> list[dict]:
+def _load_device_photos(
+    include_hidden: bool = False,
+    limit: int | None = None,
+    query: str = "",
+    tag: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    source_type: str = "",
+) -> list[dict]:
     _sync_device_library_from_output()
     conn = sqlite3.connect(str(UPLOAD_DB_PATH))
     conn.row_factory = sqlite3.Row
-    where_sql = "" if include_hidden else "WHERE IFNULL(hidden, 0) = 0"
+    where_clauses = []
+    params = []
+    if not include_hidden:
+        where_clauses.append("IFNULL(hidden, 0) = 0")
+
+    for token in [item for item in re.split(r"\s+", query.strip()) if item]:
+        search_value = f"%{token}%"
+        where_clauses.append("""
+            (
+                id LIKE ? OR IFNULL(caption, '') LIKE ?
+                OR IFNULL(uploader_name, '') LIKE ?
+                OR IFNULL(tags, '') LIKE ?
+                OR IFNULL(city, '') LIKE ?
+                OR IFNULL(source_ref, '') LIKE ?
+            )
+        """)
+        params.extend([search_value] * 6)
+
+    normalized_tag = _normalize_tags(tag)
+    if normalized_tag:
+        where_clauses.append("(',' || IFNULL(tags, '') || ',') LIKE ?")
+        params.append(f"%,{normalized_tag[0]},%")
+    if date_from:
+        where_clauses.append(
+            "substr(COALESCE(NULLIF(taken_at, ''), target_date), 1, 10) >= ?"
+        )
+        params.append(date_from)
+    if date_to:
+        where_clauses.append(
+            "substr(COALESCE(NULLIF(taken_at, ''), target_date), 1, 10) <= ?"
+        )
+        params.append(date_to)
+    if source_type in {"upload", "output"}:
+        where_clauses.append("source_type = ?")
+        params.append(source_type)
+
+    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
     limit_sql = "" if limit is None else "LIMIT ?"
-    params = [] if limit is None else [limit]
+    if limit is not None:
+        params.append(limit)
     rows = conn.execute(f"""
         SELECT id, rgb565_path, preview_path, caption, uploader_name,
-               source_type, source_ref, target_date, created_at, hidden
+               source_type, source_ref, target_date, created_at, hidden,
+               tags, taken_at, city, embedding_json, embedding_hash,
+               embedding_model
         FROM device_photos
         {where_sql}
-        ORDER BY datetime(created_at) DESC, id
+        ORDER BY COALESCE(NULLIF(taken_at, ''), target_date) DESC,
+                 datetime(created_at) DESC, id
         {limit_sql}
     """, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+def _device_photo_tag_facets(include_hidden: bool = False) -> list[dict]:
+    conn = sqlite3.connect(str(UPLOAD_DB_PATH))
+    where_sql = "" if include_hidden else "WHERE IFNULL(hidden, 0) = 0"
+    rows = conn.execute(f"SELECT tags FROM device_photos {where_sql}").fetchall()
+    conn.close()
+    counts = {}
+    for (value,) in rows:
+        for tag in _normalize_tags(value):
+            counts[tag] = counts.get(tag, 0) + 1
+    return [
+        {"tag": tag, "count": count}
+        for tag, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
 
 def _get_device_photo(photo_id: str, include_hidden: bool = False) -> dict | None:
     conn = sqlite3.connect(str(UPLOAD_DB_PATH))
@@ -934,9 +1432,60 @@ def _write_display_variant(src_img: Image.Image, orientation: str, rgb565_path: 
     rgb565_path.write_bytes(_image_to_rgb565_bytes(rendered))
     rendered.save(preview_path, "JPEG", quality=85)
 
-def _generate_upload_caption_with_gemini(img: Image.Image) -> str | None:
+def _extract_gemini_text(data: dict) -> str:
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return ""
+    parts = (
+        candidates[0]
+        .get("content", {})
+        .get("parts", [])
+    )
+    return "".join(part.get("text", "") for part in parts).strip()
+
+def _parse_gemini_json(text: str) -> dict:
+    value = (text or "").strip()
+    if value.startswith("```"):
+        value = re.sub(r"^```(?:json)?\s*", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s*```$", "", value)
+    try:
+        result = json.loads(value)
+    except (TypeError, ValueError):
+        match = re.search(r"\{.*\}", value, flags=re.DOTALL)
+        if not match:
+            return {}
+        try:
+            result = json.loads(match.group(0))
+        except (TypeError, ValueError):
+            return {}
+    return result if isinstance(result, dict) else {}
+
+class GeminiAnalysisError(RuntimeError):
+    pass
+
+def _gemini_error_message(resp: requests.Response) -> str:
+    try:
+        payload = resp.json()
+        message = str(payload.get("error", {}).get("message") or "").strip()
+    except (TypeError, ValueError):
+        message = ""
+    if resp.status_code == 429:
+        return message or "Gemini 请求过于频繁或免费额度暂时受限"
+    if resp.status_code in {401, 403}:
+        return message or "Gemini API 密钥无效或没有模型权限"
+    if resp.status_code >= 500:
+        return message or "Gemini 服务暂时不可用"
+    return message or f"Gemini 请求失败（HTTP {resp.status_code}）"
+
+def _analyze_image_with_gemini(
+    img: Image.Image,
+    *,
+    raise_errors: bool = False,
+) -> dict:
     if not ENABLE_GEMINI_CAPTION or not GEMINI_API_KEY:
-        return None
+        if raise_errors:
+            raise GeminiAnalysisError("Gemini 识图未配置")
+        return {}
     try:
         preview = ImageOps.exif_transpose(img).convert("RGB")
         preview.thumbnail((1024, 1024), Image.LANCZOS)
@@ -945,10 +1494,15 @@ def _generate_upload_caption_with_gemini(img: Image.Image) -> str | None:
         image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
         prompt = (
-            "请观察这张照片，为电子相册屏幕底部生成一句中文短文案。"
-            "要求：20字以内，温柔自然，不要出现“这张图片/照片中”等说明腔，"
-            "不要编造人物身份、地点和具体事件，只描述能看到的画面或氛围。"
-            "只输出文案本身。"
+            "分析这张电子相册图片，只输出一个JSON对象，不要输出Markdown。"
+            "格式为：{\"caption\":\"中文短文案\",\"tags\":[\"标签1\",\"标签2\"]}。"
+            "caption要求20字以内、自然简洁，不要出现“这张图片/照片中”等说明腔。"
+            "tags提供4到10个便于检索的中文标签，优先包含："
+            "可确认的角色名、作品或游戏名、人物或动物、主要物体、场景、风格和主色。"
+            "例如确实能确认是琪露诺或《我的世界》时，应分别包含“琪露诺”、"
+            "“东方Project”或“我的世界”等具体标签。"
+            "只有较有把握时才写具体IP、角色和作品名；无法确认时使用通用视觉标签。"
+            "不要根据画面猜测拍摄地点、人物真实身份或具体事件。"
         )
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -963,31 +1517,50 @@ def _generate_upload_caption_with_gemini(img: Image.Image) -> str | None:
                 ],
             }],
             "generationConfig": {
-                "temperature": 0.45,
-                "maxOutputTokens": 80,
+                "temperature": 0.2,
+                "maxOutputTokens": 256,
+                "responseMimeType": "application/json",
             },
         }
-        resp = requests.post(
-            url,
-            params={"key": GEMINI_API_KEY},
-            json=payload,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        parts = (
-            data.get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [])
-        )
-        text = "".join(part.get("text", "") for part in parts).strip()
-        text = text.strip(" \t\r\n\"'“”‘’")
-        if not text:
-            return None
-        return text[:50]
+        last_error = "Gemini 未返回有效识别结果"
+        for attempt in range(2):
+            try:
+                resp = requests.post(
+                    url,
+                    params={"key": GEMINI_API_KEY},
+                    json=payload,
+                    timeout=25,
+                )
+                if not resp.ok:
+                    last_error = _gemini_error_message(resp)
+                else:
+                    text = _extract_gemini_text(resp.json())
+                    result = _parse_gemini_json(text)
+                    caption = str(result.get("caption") or "").strip(" \t\r\n\"'“”‘’")[:50]
+                    tags = _normalize_tags(result.get("tags"))[:10]
+                    if caption or tags:
+                        return {"caption": caption, "tags": tags}
+                    last_error = "Gemini 返回了空内容或无法解析的 JSON"
+            except requests.Timeout:
+                last_error = "Gemini 请求超时"
+            except requests.RequestException as exc:
+                last_error = f"Gemini 网络请求失败: {exc}"
+            if attempt == 0:
+                time.sleep(1.2)
+        if raise_errors:
+            raise GeminiAnalysisError(last_error)
+        print(f"[WARN] Gemini image analysis failed: {last_error}")
+        return {}
+    except GeminiAnalysisError:
+        raise
     except Exception as exc:
-        print(f"[WARN] Gemini caption failed: {exc}")
-        return None
+        if raise_errors:
+            raise GeminiAnalysisError(f"Gemini 识图异常: {exc}") from exc
+        print(f"[WARN] Gemini image analysis failed: {exc}")
+        return {}
+
+def _generate_upload_caption_with_gemini(img: Image.Image) -> str | None:
+    return _analyze_image_with_gemini(img).get("caption") or None
 
 @app.get("/library")
 def device_library_page():
@@ -996,7 +1569,15 @@ def device_library_page():
 @app.get("/api/device-library")
 def api_device_library():
     include_hidden = request.args.get("include_hidden") == "1"
-    rows = _load_device_photos(include_hidden=include_hidden, limit=None)
+    rows = _load_device_photos(
+        include_hidden=include_hidden,
+        limit=None,
+        query=request.args.get("q", ""),
+        tag=request.args.get("tag", ""),
+        date_from=request.args.get("date_from", ""),
+        date_to=request.args.get("date_to", ""),
+        source_type=request.args.get("source_type", ""),
+    )
     result = []
     for r in rows:
         result.append({
@@ -1005,13 +1586,30 @@ def api_device_library():
             "uploader_name": r.get("uploader_name") or "",
             "source_type": r.get("source_type") or "",
             "target_date": r.get("target_date") or "",
+            "taken_at": r.get("taken_at") or r.get("target_date") or "",
+            "city": r.get("city") or "",
+            "tags": _normalize_tags(r.get("tags")),
+            "tags_text": _serialize_tags(r.get("tags")),
+            "semantic_indexed": bool(r.get("embedding_json")),
+            "semantic_index_current": bool(
+                r.get("embedding_json")
+                and r.get("embedding_hash") == _embedding_content_hash(r)
+                and r.get("embedding_model") == GEMINI_EMBEDDING_MODEL
+            ),
             "created_at": r.get("created_at") or "",
             "hidden": bool(r.get("hidden")),
             "preview_url": f"/api/photo/{r['id']}.jpg",
             "preview_portrait_url": f"/api/photo/{r['id']}.jpg?orientation=portrait",
             "rgb565_url": f"/api/photo/{r['id']}.rgb565",
         })
-    return jsonify({"photos": result, "count": len(result)})
+    return jsonify({
+        "photos": result,
+        "count": len(result),
+        "tag_facets": _device_photo_tag_facets(include_hidden=include_hidden),
+        "semantic_indexed_count": sum(
+            1 for photo in result if photo["semantic_index_current"]
+        ),
+    })
 
 @app.post("/api/device-library/update")
 def api_device_library_update():
@@ -1019,22 +1617,215 @@ def api_device_library_update():
     photo_id = (data.get("id") or "").strip()
     if not photo_id:
         return jsonify({"ok": False, "error": "missing id"}), 400
+    photo = _get_device_photo(photo_id, include_hidden=True)
+    if not photo:
+        return jsonify({"ok": False, "error": "not found"}), 404
+
+    taken_at = str(data.get("taken_at", photo.get("taken_at") or "") or "").strip()
+    if taken_at and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", taken_at):
+        return jsonify({"ok": False, "error": "invalid taken_at"}), 400
+    city = str(data.get("city", photo.get("city") or "") or "").strip()[:64]
+
     fields = []
     params = []
     if "caption" in data:
         fields.append("caption = ?")
         params.append(str(data.get("caption") or "")[:256])
+    if "city" in data:
+        fields.append("city = ?")
+        params.append(city)
+    if "taken_at" in data:
+        fields.append("taken_at = ?")
+        params.append(taken_at)
+    if any(key in data for key in ("tags", "city", "taken_at")):
+        supplied_tags = data.get("tags", photo.get("tags") or "")
+        manual_tags = _strip_derived_tags(supplied_tags, photo.get("city") or "")
+        fields.append("tags = ?")
+        params.append(_build_photo_tags(
+            explicit_tags=manual_tags,
+            date_value=taken_at,
+            city=city,
+            source_type=photo.get("source_type") or "",
+        ))
     if "hidden" in data:
         fields.append("hidden = ?")
         params.append(1 if data.get("hidden") else 0)
     if not fields:
         return jsonify({"ok": False, "error": "no fields"}), 400
+    if any(key in data for key in ("caption", "tags", "city", "taken_at")):
+        fields.extend([
+            "embedding_json = ''",
+            "embedding_hash = ''",
+            "embedding_model = ''",
+        ])
     params.append(photo_id)
     conn = sqlite3.connect(str(UPLOAD_DB_PATH))
     cur = conn.execute(f"UPDATE device_photos SET {', '.join(fields)} WHERE id = ?", params)
     conn.commit()
     conn.close()
     return jsonify({"ok": cur.rowcount > 0})
+
+@app.post("/api/device-library/analyze")
+def api_device_library_analyze():
+    data = request.json or {}
+    photo_id = (data.get("id") or "").strip()
+    if not photo_id:
+        return jsonify({"ok": False, "error": "missing id"}), 400
+    if not ENABLE_GEMINI_CAPTION or not GEMINI_API_KEY:
+        return jsonify({"ok": False, "error": "Gemini 识图未配置"}), 503
+
+    photo = _get_device_photo(photo_id, include_hidden=True)
+    if not photo:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    source_path = _resolve_device_photo_source(photo)
+    if not source_path or not source_path.exists():
+        return jsonify({"ok": False, "error": "找不到可识别的图片文件"}), 404
+    try:
+        with Image.open(source_path) as source_image:
+            analysis = _analyze_image_with_gemini(source_image, raise_errors=True)
+    except GeminiAnalysisError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"无法读取图片: {exc}"}), 400
+    if not analysis:
+        return jsonify({"ok": False, "error": "Gemini 未返回有效识别结果"}), 502
+
+    manual_tags = _strip_derived_tags(photo.get("tags"), photo.get("city") or "")
+    ai_tags = _strip_derived_tags(analysis.get("tags", []))
+    merged_tags = _normalize_tags(manual_tags + ai_tags)
+    tags = _build_photo_tags(
+        explicit_tags=merged_tags,
+        date_value=photo.get("taken_at") or photo.get("target_date") or "",
+        city=photo.get("city") or "",
+        source_type=photo.get("source_type") or "",
+    )
+    fields = [
+        "tags = ?",
+        "embedding_json = ''",
+        "embedding_hash = ''",
+        "embedding_model = ''",
+    ]
+    params = [tags]
+    replace_caption = bool(data.get("replace_caption"))
+    suggested_caption = analysis.get("caption") or ""
+    if replace_caption and suggested_caption:
+        fields.append("caption = ?")
+        params.append(suggested_caption)
+    params.append(photo_id)
+
+    conn = sqlite3.connect(str(UPLOAD_DB_PATH))
+    cur = conn.execute(
+        f"UPDATE device_photos SET {', '.join(fields)} WHERE id = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({
+        "ok": cur.rowcount > 0,
+        "tags": _normalize_tags(tags),
+        "tags_text": tags,
+        "suggested_caption": suggested_caption,
+    })
+
+@app.post("/api/device-library/semantic-index")
+def api_device_library_semantic_index():
+    data = request.json or {}
+    force = bool(data.get("force"))
+    photos = _load_device_photos(include_hidden=False, limit=None)
+    updated = 0
+    skipped = 0
+    errors = []
+    for photo in photos:
+        try:
+            if _refresh_photo_embedding(photo, force=force):
+                updated += 1
+            else:
+                skipped += 1
+        except GeminiAnalysisError as exc:
+            errors.append({"id": photo["id"], "error": str(exc)})
+    status = 200 if not errors else (207 if updated or skipped else 502)
+    return jsonify({
+        "ok": not errors,
+        "total": len(photos),
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+        "model": GEMINI_EMBEDDING_MODEL,
+    }), status
+
+@app.get("/api/photo/semantic-search")
+def api_photo_semantic_search():
+    query = (request.args.get("q") or "").strip()
+    if not query:
+        return jsonify({"ok": False, "error": "missing q parameter"}), 400
+    try:
+        limit = max(1, min(int(request.args.get("limit", 5)), 20))
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid limit"}), 400
+    try:
+        min_score = max(0.0, min(float(request.args.get("min_score", 0.55)), 1.0))
+        max_score_gap = max(0.02, min(float(request.args.get("max_score_gap", 0.10)), 0.30))
+        adjacent_score_gap = max(
+            0.02,
+            min(float(request.args.get("adjacent_score_gap", 0.06)), 0.20),
+        )
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid semantic threshold"}), 400
+
+    photos = _load_device_photos(include_hidden=False, limit=None)
+    indexed = 0
+    for photo in photos:
+        try:
+            if (
+                not photo.get("embedding_json")
+                or photo.get("embedding_hash") != _embedding_content_hash(photo)
+                or photo.get("embedding_model") != GEMINI_EMBEDDING_MODEL
+            ):
+                _refresh_photo_embedding(photo)
+                indexed += 1
+        except GeminiAnalysisError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 502
+
+    try:
+        matches = _semantic_search_device_photos(
+            query,
+            limit=limit,
+            min_score=min_score,
+            max_score_gap=max_score_gap,
+            adjacent_score_gap=adjacent_score_gap,
+        )
+    except GeminiAnalysisError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+    results = [{
+        "id": photo["id"],
+        "caption": photo.get("caption") or "",
+        "tags": _normalize_tags(photo.get("tags")),
+        "city": photo.get("city") or "",
+        "date": photo.get("taken_at") or photo.get("target_date") or "",
+        "score": photo["semantic_score"],
+        "preview_url": f"/api/photo/{photo['id']}.jpg",
+        "rgb565_url": f"/api/photo/{photo['id']}.rgb565",
+    } for photo in matches]
+
+    jumped_to = ""
+    if request.args.get("jump") == "1" and results:
+        jumped_to = results[0]["id"]
+        _queue_device_command({
+            "cmd": "switch_photo",
+            "target_id": jumped_to,
+        })
+    return jsonify({
+        "ok": True,
+        "query": query,
+        "count": len(results),
+        "indexed": indexed,
+        "jumped_to": jumped_to,
+        "results": results,
+        "model": GEMINI_EMBEDDING_MODEL,
+        "min_score": min_score,
+        "max_score_gap": max_score_gap,
+        "adjacent_score_gap": adjacent_score_gap,
+    })
 
 @app.post("/api/device-library/delete")
 def api_device_library_delete():
@@ -1099,6 +1890,8 @@ def api_today():
                 if tag in (p.get("caption") or "").lower()
                 or tag in (p.get("uploader_name") or "").lower()
                 or tag in (p.get("id") or "").lower()
+                or tag in (p.get("tags") or "").lower()
+                or tag in (p.get("city") or "").lower()
             ]
         return {
             "date": str(today),
@@ -1110,9 +1903,10 @@ def api_today():
                 "side": p.get("caption") or "",
                 "caption": p.get("caption") or "",
                 "memory": 100,
-                "city": p.get("uploader_name") or "",
+                "city": p.get("city") or p.get("uploader_name") or "",
                 "lat": 0,
                 "lon": 0,
+                "tags": _normalize_tags(p.get("tags")),
             } for p in library_photos],
         }
     if not DB_PATH.exists():
@@ -1207,6 +2001,51 @@ def api_photo_search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"error": "missing q parameter"}), 400
+
+    device_rows = _load_device_photos(query=q, limit=1)
+    if device_rows:
+        photo = device_rows[0]
+        photo_id = photo["id"]
+        return jsonify({
+            "id": photo_id,
+            "caption": photo.get("caption") or "",
+            "side_caption": photo.get("caption") or "",
+            "date": photo.get("taken_at") or photo.get("target_date") or "",
+            "city": photo.get("city") or "",
+            "tags": _normalize_tags(photo.get("tags")),
+            "source_type": photo.get("source_type") or "",
+            "url": f"http://{request.host}/api/photo/{photo_id}.jpg",
+            "rgb565_url": f"http://{request.host}/api/photo/{photo_id}.rgb565",
+        })
+
+    try:
+        photos = _load_device_photos(include_hidden=False, limit=None)
+        for photo in photos:
+            if (
+                not photo.get("embedding_json")
+                or photo.get("embedding_hash") != _embedding_content_hash(photo)
+                or photo.get("embedding_model") != GEMINI_EMBEDDING_MODEL
+            ):
+                _refresh_photo_embedding(photo)
+        semantic_rows = _semantic_search_device_photos(q, limit=1)
+    except GeminiAnalysisError:
+        semantic_rows = []
+    if semantic_rows:
+        photo = semantic_rows[0]
+        photo_id = photo["id"]
+        return jsonify({
+            "id": photo_id,
+            "caption": photo.get("caption") or "",
+            "side_caption": photo.get("caption") or "",
+            "date": photo.get("taken_at") or photo.get("target_date") or "",
+            "city": photo.get("city") or "",
+            "tags": _normalize_tags(photo.get("tags")),
+            "source_type": photo.get("source_type") or "",
+            "semantic_score": photo["semantic_score"],
+            "url": f"http://{request.host}/api/photo/{photo_id}.jpg",
+            "rgb565_url": f"http://{request.host}/api/photo/{photo_id}.rgb565",
+        })
+
     rows, total = load_rows(query=q, page_size=1, sort="memory")
     if rows:
         photo = rows[0]
@@ -1304,10 +2143,11 @@ def phone_upload():
     preview_path = UPLOAD_DIR / f"{sid}_preview.jpg"
     _write_display_variant(img, "landscape", rgb565_path, preview_path)
 
+    image_analysis = _analyze_image_with_gemini(img)
     user_message = (request.form.get("message", "") or "").strip()[:50]
     message = (
         user_message
-        or _generate_upload_caption_with_gemini(img)
+        or image_analysis.get("caption")
         or _fallback_upload_caption(file.filename)
     )
     uploader = (request.form.get("name", "") or "").strip()[:20]
@@ -1323,8 +2163,9 @@ def phone_upload():
     conn.execute("""
         INSERT INTO device_photos
             (id, rgb565_path, preview_path, caption, uploader_name,
-             source_type, source_ref, target_date, created_at, hidden)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), 0)
+             source_type, source_ref, target_date, created_at, hidden,
+             tags, taken_at, city)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), 0, ?, ?, '')
     """, (
         f"upload_{sid}",
         str(rgb565_path),
@@ -1333,6 +2174,12 @@ def phone_upload():
         uploader or "上传",
         "upload",
         sid,
+        target_date,
+        _build_photo_tags(
+            explicit_tags=_strip_derived_tags(image_analysis.get("tags", [])),
+            date_value=target_date,
+            source_type="upload",
+        ),
         target_date,
     ))
     conn.commit()

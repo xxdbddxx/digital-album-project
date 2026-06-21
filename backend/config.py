@@ -15,8 +15,10 @@ UPLOAD_DB_PATH = "./upload.db"
 # --- 上传照片原图存储目录 ---
 UPLOAD_DIR = "./upload_photos"
 
-# --- 已迁移至本地模型 (Ollama + whisper + edge-tts) ---
-# 不再需要阿里云 API 密钥
+# --- 语音助手 LLM ---
+# voice_server.py 默认使用 DeepSeek V4 Flash。
+# 密钥通过环境变量 DEEPSEEK_API_KEY 设置，不要写入仓库。
+# 如需切回本地 Ollama，设置环境变量 LLM_PROVIDER=ollama。
 
 
 
@@ -77,4 +79,5 @@ OLLAMA_MODEL = "qwen2.5:0.5b"
 # Gemini 识图文案生成。密钥不要写在这里，运行前设置环境变量 GEMINI_API_KEY。
 ENABLE_GEMINI_CAPTION = True
 GEMINI_VISION_MODEL = "gemini-2.5-flash-lite"
+GEMINI_EMBEDDING_MODEL = "gemini-embedding-2"
 

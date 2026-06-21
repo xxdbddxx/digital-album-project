@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include "voice_assistant_task.h"
 #include "voice_assistant.h"
+#include "esp_wn_iface.h"
 #include "lvgl_ui_task.h"
 #include "../../lv_ui/src/lv_voice_assistant.h"
 #include "peripherals_task.h"
@@ -152,7 +153,11 @@ static void va_on_wake(void *ctx)
 static void va_on_response_done(void *ctx)
 {
     (void)ctx;
-    /* LLM 语音回复播放完毕，可在此更新 UI */
+    /*
+     * The final CJSON frame arrives immediately after TTS completes.
+     * Keep the overlay alive so dialogue.tts_text can be rendered; the
+     * typewriter timer dismisses it after the reply has been readable.
+     */
 }
 
 /*
@@ -198,8 +203,8 @@ void app_voice_assistant(void *param)
 
     va_config_t cfg = {
         .ws_uri    = CONFIG_VA_WS_URI,  /* Kconfig 中配置的语音服务器地址 */
-        .wake_word = NULL,              /* NULL = 使用默认唤醒词 "nihaoxiaozhi" */
-        .det_mode  = 0,                 /* 0 代表 DET_MODE_90，避免唤醒阈值过高导致无法触发 */
+        .wake_word = "你好小智",
+        .det_mode  = DET_MODE_90,
     };
 
     va_callbacks_t cbs = {

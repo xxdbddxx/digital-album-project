@@ -39,7 +39,7 @@ static lv_obj_t *ai_label = NULL;          // AI 答复文本 label
 /* 动效与定时器辅助变量 */
 static lv_timer_t *typewriter_timer = NULL;
 static lv_timer_t *exit_timer = NULL;
-static char typewriter_text[512];
+static char typewriter_text[1024];
 static uint32_t typewriter_index = 0;
 
 /* 前向声明 */
@@ -52,7 +52,7 @@ static void va_exit_timer_cb(lv_timer_t *t);
  * 每帧都会疯狂输出 [Warn] glyph not found 日志洪水，拖垮串口和调度器。
  * 解决方案：在文本送入 lv_label 之前，逐字扫描 UTF-8 序列：
  *   - ASCII 空格(0x20) → 替换为全角空格(U+3000 = \xe3\x80\x80)
- *   - 繁体字/不支持字符 → 直接跳过（静默丢弃）
+ *   - 使用实际字体查询 glyph；字库未收录的字符直接跳过
  */
 static void sanitize_for_cjk_font(const char *src, char *dst, size_t dst_size) {
     if (!src || !dst || dst_size < 4) { if (dst) dst[0] = '\0'; return; }
@@ -71,21 +71,26 @@ static void sanitize_for_cjk_font(const char *src, char *dst, size_t dst_size) {
             uint32_t cp = ((uint32_t)(*s & 0x0F) << 12)
                         | ((uint32_t)(*(s+1) & 0x3F) << 6)
                         |  (uint32_t)(*(s+2) & 0x3F);
-            // 保留简体 CJK (U+4E00–U+9FFF) 和全角标点 (U+FF00–U+FFFF)
-            // 繁体字、扩展 CJK 等直接丢弃（避免 glyph dsc. not found 日志）
-            if ((cp >= 0x4E00 && cp <= 0x9FFF) ||
-                (cp >= 0xFF00 && cp <= 0xFFFF) ||
-                (cp >= 0x3000 && cp <= 0x303F)) {
+            /*
+             * The generated CJK font contains only a subset of the Unicode
+             * CJK block. A range check accepts unsupported Traditional
+             * characters and causes LVGL to log glyph-not-found every frame.
+             */
+            lv_font_glyph_dsc_t glyph_dsc;
+            if (lv_font_get_glyph_dsc(&lv_font_cjk_16, &glyph_dsc, cp, 0)) {
                 dst[di++] = (char)*s;
                 dst[di++] = (char)*(s+1);
                 dst[di++] = (char)*(s+2);
             }
-            // 繁体/不支持字符 → 静默跳过
             s += 3;
         } else if ((*s & 0xE0) == 0xC0 && *(s+1)) {
-            // 2字节 UTF-8（拉丁扩展等），尝试直接保留
-            dst[di++] = (char)*s;
-            dst[di++] = (char)*(s+1);
+            uint32_t cp = ((uint32_t)(*s & 0x1F) << 6)
+                        |  (uint32_t)(*(s+1) & 0x3F);
+            lv_font_glyph_dsc_t glyph_dsc;
+            if (lv_font_get_glyph_dsc(&lv_font_cjk_16, &glyph_dsc, cp, 0)) {
+                dst[di++] = (char)*s;
+                dst[di++] = (char)*(s+1);
+            }
             s += 2;
         } else if ((*s & 0xF8) == 0xF0 && *(s+1) && *(s+2) && *(s+3)) {
             // 4字节 UTF-8（Emoji 等），字库不含，静默跳过
@@ -98,7 +103,15 @@ static void sanitize_for_cjk_font(const char *src, char *dst, size_t dst_size) {
 }
 
 // 静态净化缓冲区（避免在回调里动态分配，预留前缀空间）
-static char s_sanitized_text[480];
+static char s_sanitized_text[960];
+
+static lv_coord_t va_dialog_target_y(void) {
+    if (!assistant_layer || !dialog_box) return 0;
+    lv_obj_update_layout(assistant_layer);
+    lv_coord_t target =
+        lv_obj_get_height(assistant_layer) - lv_obj_get_height(dialog_box) - 16;
+    return target > 0 ? target : 0;
+}
 
 /* ── 动效底层回调函数 ── */
 static void va_anim_set_bg_opa_cb(void *var, int32_t v) {
@@ -188,7 +201,8 @@ static void va_dismiss_anim_ready_cb(lv_anim_t *a) {
 static void lv_va_create_dialog(void) {
     lv_obj_t *scr = lv_scr_act();
     assistant_layer = lv_obj_create(scr);
-    lv_obj_set_size(assistant_layer, LV_HOR_RES, LV_VER_RES);
+    /* Keep the overlay tied to the active screen size across rotation. */
+    lv_obj_set_size(assistant_layer, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(assistant_layer, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_grad_dir(assistant_layer, LV_GRAD_DIR_NONE, 0); // 显式关闭默认垂直渐变色以消除灰色雾霾
     lv_obj_set_style_shadow_width(assistant_layer, 0, 0); // 显式消除阴影
@@ -199,14 +213,19 @@ static void lv_va_create_dialog(void) {
 
     // 对话卡片（居中、圆角、半透明深灰底）
     dialog_box = lv_obj_create(assistant_layer);
-    lv_obj_set_size(dialog_box, 192, 160); // 192x160 迷你尺寸
+    lv_obj_update_layout(scr);
+    lv_coord_t screen_w = lv_obj_get_width(scr);
+    lv_coord_t screen_h = lv_obj_get_height(scr);
+    lv_coord_t dialog_w = LV_MIN(screen_w - 32, 520);
+    lv_coord_t dialog_h = LV_MIN(screen_h - 32, screen_h > screen_w ? 280 : 220);
+    lv_obj_set_size(dialog_box, dialog_w, dialog_h);
     lv_obj_set_style_bg_color(dialog_box, lv_color_hex(0x1E1E24), 0); // 高雅深太灰色
     lv_obj_set_style_bg_opa(dialog_box, 230, 0); // ~90% 不透明度
     lv_obj_set_style_radius(dialog_box, 16, 0); // 圆角矩形
     lv_obj_set_style_border_width(dialog_box, 0, 0);
     lv_obj_set_style_pad_all(dialog_box, 8, 0); // 缩窄边距
     lv_obj_clear_flag(dialog_box, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(dialog_box, LV_ALIGN_CENTER, 0, 400); // 初始偏下，等待跃入
+    lv_obj_set_pos(dialog_box, (screen_w - dialog_w) / 2, screen_h);
 
     // A. 顶部中文状态标签
     state_title = lv_label_create(dialog_box);
@@ -244,7 +263,7 @@ static void lv_va_create_dialog(void) {
 
     // C. 文本对话区容器 (Flex Column)
     chat_container = lv_obj_create(dialog_box);
-    lv_obj_set_size(chat_container, 180, 56); // 180x56 迷你文本窗
+    lv_obj_set_size(chat_container, dialog_w - 16, dialog_h - 104);
     lv_obj_align(chat_container, LV_ALIGN_BOTTOM_MID, 0, -4);
     lv_obj_set_style_bg_opa(chat_container, 0, 0);
     lv_obj_set_style_border_width(chat_container, 0, 0);
@@ -324,9 +343,23 @@ void lv_va_show_state(LvVaState state) {
         lv_va_create_dialog();
     }
     
-    // 清除打字机与退场定时器，避免状态重叠
-    if (typewriter_timer) { lv_timer_del(typewriter_timer); typewriter_timer = NULL; }
-    if (exit_timer) { lv_timer_del(exit_timer); exit_timer = NULL; }
+    /*
+     * Continuous listening can begin while the previous reply is still
+     * typing. Preserve that timer for intermediate states so the reply can
+     * finish and schedule its normal dismissal.
+     */
+    if (state == LV_VA_STATE_WAKE ||
+        state == LV_VA_STATE_REPLY ||
+        state == LV_VA_STATE_EXIT) {
+        if (typewriter_timer) {
+            lv_timer_del(typewriter_timer);
+            typewriter_timer = NULL;
+        }
+        if (exit_timer) {
+            lv_timer_del(exit_timer);
+            exit_timer = NULL;
+        }
+    }
 
     switch (state) {
         case LV_VA_STATE_WAKE: {
@@ -341,11 +374,13 @@ void lv_va_show_state(LvVaState state) {
             lv_anim_set_exec_cb(&a_mask, va_anim_set_bg_opa_cb);
             lv_anim_start(&a_mask);
             
-            // 2. 卡片阻尼回弹入场 (overshoot) 从 800 -> 320
+            // 2. 卡片从屏幕底部进入，目标位置随横竖屏尺寸计算
             lv_anim_t a_card;
             lv_anim_init(&a_card);
             lv_anim_set_var(&a_card, dialog_box);
-            lv_anim_set_values(&a_card, 800, 320);
+            lv_anim_set_values(
+                &a_card, lv_obj_get_height(assistant_layer),
+                va_dialog_target_y());
             lv_anim_set_time(&a_card, 550);
             lv_anim_set_path_cb(&a_card, lv_anim_path_overshoot);
             lv_anim_set_exec_cb(&a_card, va_anim_set_y_cb);
@@ -418,11 +453,13 @@ void lv_va_show_state(LvVaState state) {
                 lv_anim_set_exec_cb(&a_mask, va_anim_set_bg_opa_cb);
                 lv_anim_start(&a_mask);
                 
-                // 2. 卡片滑出屏幕 (ease_in) 从 320 -> 800
+                // 2. 卡片滑出屏幕
                 lv_anim_t a_card;
                 lv_anim_init(&a_card);
                 lv_anim_set_var(&a_card, dialog_box);
-                lv_anim_set_values(&a_card, 320, 800);
+                lv_anim_set_values(
+                    &a_card, va_dialog_target_y(),
+                    lv_obj_get_height(assistant_layer));
                 lv_anim_set_time(&a_card, 400);
                 lv_anim_set_path_cb(&a_card, lv_anim_path_ease_in);
                 lv_anim_set_exec_cb(&a_card, va_anim_set_y_cb);
@@ -486,8 +523,9 @@ void lv_va_show_text(const char *user_text, const char *ai_text, const char *emo
     if (ai_text && strlen(ai_text) > 0) {
         // 净化文本后再送入打字机效果
         sanitize_for_cjk_font(ai_text, s_sanitized_text, sizeof(s_sanitized_text));
-        snprintf(typewriter_text, sizeof(typewriter_text), "小智：%.466s", s_sanitized_text);
+        snprintf(typewriter_text, sizeof(typewriter_text), "小智：%.940s", s_sanitized_text);
         typewriter_index = 0;
+        lv_obj_add_flag(user_label, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(ai_label, "");
         lv_obj_clear_flag(ai_label, LV_OBJ_FLAG_HIDDEN);
         if (typewriter_timer) {

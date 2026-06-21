@@ -10,6 +10,12 @@ void stream_player_play_url(const char *url);
 // 播放指定 URL 的 MP3 文件，支持循环（EOF 后自动重连）
 void stream_player_play_url_with_loop(const char *url, bool loop);
 
+// 播放 16kHz / 16-bit / mono little-endian 原始 PCM 流
+void stream_player_play_pcm_url(const char *url);
+
+// 播放原始 PCM 流，支持 EOF 后重新连接循环播放
+void stream_player_play_pcm_url_with_loop(const char *url, bool loop);
+
 // 停止当前流媒体播放
 void stream_player_stop(void);
 

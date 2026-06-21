@@ -92,6 +92,12 @@
             try {
                 const data = JSON.parse(e.data);
                 if (data.type === 'heartbeat') return;
+                if (data.type === 'user_message' && data.text) {
+                    appendMsg('user', data.text);
+                    scrollToBottom();
+                    loadTimeline();
+                    return;
+                }
                 if (data.type === 'ai_reply' && data.reply) {
                     if (_pendingAiBubble) {
                         // 把"正在思考..."替换为真正的 AI 回复内容

@@ -3,93 +3,263 @@
 {% block title %}设备照片库 - 云端电子相册{% endblock %}
 
 {% block content %}
-<div style="display:flex; justify-content:space-between; align-items:flex-start; gap:24px; margin-bottom:24px;">
+<div class="library-heading">
     <div>
-        <h1 style="font-size:1.8rem; margin-bottom:6px;">设备照片库</h1>
-        <p style="color:var(--muted); font-size:0.95rem;">这里管理 ESP32 实际会轮播和下载的照片。上传图片会自动加入此库。</p>
+        <h1>设备照片库</h1>
+        <p>管理 ESP32 实际轮播的照片，并按标签、日期和地点检索。</p>
     </div>
-    <label style="display:flex; align-items:center; gap:8px; color:var(--muted); font-size:0.9rem;">
+    <label class="library-check">
         <input type="checkbox" id="show-hidden">
         显示已隐藏
     </label>
 </div>
 
+<div class="filters-bar library-filters">
+    <div class="filter-group library-search">
+        <label for="library-query">搜索</label>
+        <input id="library-query" type="search" placeholder="文案、标签、地点、照片 ID">
+    </div>
+    <div class="filter-group">
+        <label for="library-tag">标签</label>
+        <select id="library-tag">
+            <option value="">全部标签</option>
+        </select>
+    </div>
+    <div class="filter-group">
+        <label for="library-source">来源</label>
+        <select id="library-source">
+            <option value="">全部来源</option>
+            <option value="upload">网页上传</option>
+            <option value="output">本地图库</option>
+        </select>
+    </div>
+    <div class="filter-group library-date-range">
+        <label for="date-from">日期</label>
+        <input id="date-from" type="date" aria-label="开始日期">
+        <span>至</span>
+        <input id="date-to" type="date" aria-label="结束日期">
+    </div>
+    <button class="btn btn-outline" id="reset-filters" type="button">重置</button>
+    <button class="btn btn-outline" id="semantic-search" type="button">语义查找</button>
+    <button class="btn btn-outline" id="semantic-jump" type="button">查找并跳转</button>
+    <button class="btn btn-primary" id="build-semantic-index" type="button">更新语义索引</button>
+</div>
+
+<div class="library-summary" id="library-summary">正在加载照片索引...</div>
 <div class="gallery" id="device-library-grid"></div>
+<datalist id="known-tags"></datalist>
 {% endblock %}
 
 {% block extra_js %}
+<style>
+.library-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 24px;
+    margin-bottom: 20px;
+}
+.library-heading h1 { font-size: 1.8rem; margin-bottom: 6px; }
+.library-heading p, .library-summary { color: var(--muted); font-size: 0.92rem; }
+.library-check { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.9rem; }
+.library-filters { justify-content: flex-start; align-items: flex-end; }
+.library-filters .filter-group { flex-direction: column; align-items: flex-start; gap: 5px; }
+.library-filters label { color: var(--muted); font-size: 0.78rem; }
+.library-filters input, .library-filters select { min-height: 38px; }
+.library-search { flex: 1 1 240px; }
+.library-search input { width: 100%; }
+.library-date-range { flex-direction: row !important; align-items: center !important; flex-wrap: wrap; }
+.library-date-range label { width: 100%; }
+.library-summary { margin: -8px 0 16px; }
+.library-meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+.library-meta-grid .form-control { margin-bottom: 0; padding: 9px 10px; }
+.library-meta-grid .wide { grid-column: 1 / -1; }
+.library-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.library-actions .btn { padding: 8px 12px; }
+.library-remove { color: var(--danger); border-color: var(--danger); }
+.library-location { margin-top: 4px; color: var(--muted); font-size: 0.8rem; }
+@media (max-width: 720px) {
+    .library-heading { flex-direction: column; gap: 12px; }
+    .library-filters { align-items: stretch; }
+    .library-date-range { align-items: flex-start !important; }
+    .library-date-range input { flex: 1 1 130px; }
+}
+</style>
 <script>
 document.addEventListener("DOMContentLoaded", () => {
     const grid = document.getElementById("device-library-grid");
+    const summary = document.getElementById("library-summary");
     const showHidden = document.getElementById("show-hidden");
+    const queryInput = document.getElementById("library-query");
+    const tagSelect = document.getElementById("library-tag");
+    const sourceSelect = document.getElementById("library-source");
+    const dateFrom = document.getElementById("date-from");
+    const dateTo = document.getElementById("date-to");
+    const resetButton = document.getElementById("reset-filters");
+    const semanticSearchButton = document.getElementById("semantic-search");
+    const semanticJumpButton = document.getElementById("semantic-jump");
+    const buildSemanticIndexButton = document.getElementById("build-semantic-index");
+    const knownTags = document.getElementById("known-tags");
+    let loadTimer = null;
 
     async function requestJson(url, options = {}) {
         const res = await fetch(url, {
             headers: { "Content-Type": "application/json" },
             ...options
         });
-        return await res.json();
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `请求失败 (${res.status})`);
+        return data;
+    }
+
+    function filterUrl() {
+        const params = new URLSearchParams({
+            include_hidden: showHidden.checked ? "1" : "0",
+            q: queryInput.value.trim(),
+            tag: tagSelect.value,
+            source_type: sourceSelect.value,
+            date_from: dateFrom.value,
+            date_to: dateTo.value
+        });
+        return `/api/device-library?${params.toString()}`;
     }
 
     async function loadLibrary() {
-        const includeHidden = showHidden.checked ? "1" : "0";
-        const data = await requestJson(`/api/device-library?include_hidden=${includeHidden}`);
-        if (!data.photos || data.photos.length === 0) {
-            grid.innerHTML = `<div style="color:var(--muted);">设备照片库为空。</div>`;
+        summary.textContent = "正在检索...";
+        try {
+            const data = await requestJson(filterUrl());
+            updateTagOptions(data.tag_facets || []);
+            summary.textContent = `找到 ${data.count || 0} 张设备照片，语义索引 ${data.semantic_indexed_count || 0}/${data.count || 0}`;
+            renderPhotos(data.photos || []);
+        } catch (error) {
+            summary.textContent = error.message;
+            grid.innerHTML = "";
+        }
+    }
+
+    function updateTagOptions(facets) {
+        const selected = tagSelect.value;
+        tagSelect.innerHTML = `<option value="">全部标签</option>` + facets.map(item =>
+            `<option value="${escapeAttr(item.tag)}">${escapeHtml(item.tag)} (${item.count})</option>`
+        ).join("");
+        tagSelect.value = selected;
+        knownTags.innerHTML = facets.map(item =>
+            `<option value="${escapeAttr(item.tag)}"></option>`
+        ).join("");
+    }
+
+    function renderPhotos(photos) {
+        if (photos.length === 0) {
+            grid.innerHTML = `<div style="color:var(--muted);">没有符合当前条件的设备照片。</div>`;
             return;
         }
 
-        grid.innerHTML = data.photos.map(p => `
-            <div class="photo-card" data-id="${p.id}" data-hidden="${p.hidden ? "1" : "0"}">
+        const cacheKey = Date.now();
+        grid.innerHTML = photos.map(p => {
+            const tags = Array.isArray(p.tags) ? p.tags : [];
+            const tagsText = typeof p.tags_text === "string" ? p.tags_text : tags.join(",");
+            return `
+            <article class="photo-card" data-id="${escapeAttr(p.id)}" data-hidden="${p.hidden ? "1" : "0"}">
                 <div class="img-wrap">
-                    <img src="${p.preview_url}?t=${Date.now()}" loading="lazy" alt="${p.id}">
+                    <img src="${escapeAttr(p.preview_url)}?t=${cacheKey}" loading="lazy" alt="${escapeAttr(p.caption || p.id)}">
                 </div>
                 <div class="meta">
-                    <div class="side-caption">
-                        <span>${escapeHtml(p.caption || p.id)}</span>
-                    </div>
+                    <div class="side-caption"><span>${escapeHtml(p.caption || p.id)}</span></div>
                     <div class="scores" style="display:block; line-height:1.6;">
-                        <div>ID: <code>${p.id}</code></div>
-                        <div>来源: ${p.source_type || "library"} ${p.hidden ? " / 已隐藏" : ""}</div>
-                        <div>日期: ${p.target_date || "-"}</div>
+                        <div>ID: <code>${escapeHtml(p.id)}</code></div>
+                        <div>来源: ${sourceLabel(p.source_type)}${p.hidden ? " / 已隐藏" : ""}</div>
+                        ${typeof p.semantic_score === "number" ? `<div>语义匹配: ${(p.semantic_score * 100).toFixed(1)}%</div>` : ""}
                     </div>
-                    <input class="form-control caption-input" value="${escapeAttr(p.caption || "")}" maxlength="256" style="margin-top:12px;">
-                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                        <button class="btn btn-primary save-caption" style="padding:8px 12px;">保存文案</button>
-                        <button class="btn btn-outline toggle-hidden" style="padding:8px 12px;">${p.hidden ? "恢复显示" : "隐藏"}</button>
-                        <button class="btn btn-outline remove-photo" style="padding:8px 12px; color:var(--danger); border-color:var(--danger);">移出设备库</button>
+                    ${tags.length ? `<div class="tags-list">${tags.map(tag =>
+                        `<span class="tag-badge">${escapeHtml(tag)}</span>`
+                    ).join("")}</div>` : ""}
+                    <div class="library-location">${escapeHtml(p.city || "未记录地点")}</div>
+                    <div class="library-meta-grid">
+                        <input class="form-control caption-input wide" value="${escapeAttr(p.caption || "")}" maxlength="256" aria-label="照片文案" placeholder="照片文案">
+                        <input class="form-control tags-input wide" value="${escapeAttr(tagsText)}" maxlength="512" list="known-tags" aria-label="照片标签" placeholder="支持逗号、中文逗号、分号或顿号分隔">
+                        <input class="form-control city-input" value="${escapeAttr(p.city || "")}" maxlength="64" aria-label="拍摄地点" placeholder="拍摄地点">
+                        <input class="form-control date-input" type="date" value="${escapeAttr((p.taken_at || "").slice(0, 10))}" aria-label="拍摄日期">
+                    </div>
+                    <div class="library-actions">
+                        <button class="btn btn-primary save-metadata" type="button">保存信息</button>
+                        <button class="btn btn-outline analyze-photo" type="button" title="使用 Gemini 识别角色、作品、物体和场景">AI 识别标签</button>
+                        <button class="btn btn-outline toggle-hidden" type="button">${p.hidden ? "恢复显示" : "隐藏"}</button>
+                        <button class="btn btn-outline library-remove remove-photo" type="button">移出设备库</button>
                     </div>
                 </div>
-            </div>
-        `).join("");
+            </article>
+        `;
+        }).join("");
 
         grid.querySelectorAll(".photo-card").forEach(card => {
             const id = card.dataset.id;
-            card.querySelector(".save-caption").addEventListener("click", async () => {
-                const caption = card.querySelector(".caption-input").value;
-                const res = await requestJson("/api/device-library/update", {
-                    method: "POST",
-                    body: JSON.stringify({ id, caption })
-                });
-                if (res.ok) loadLibrary();
+            card.querySelector(".save-metadata").addEventListener("click", async event => {
+                const button = event.currentTarget;
+                button.disabled = true;
+                try {
+                    await requestJson("/api/device-library/update", {
+                        method: "POST",
+                        body: JSON.stringify({
+                            id,
+                            caption: card.querySelector(".caption-input").value,
+                            tags: card.querySelector(".tags-input").value,
+                            city: card.querySelector(".city-input").value,
+                            taken_at: card.querySelector(".date-input").value
+                        })
+                    });
+                    await loadLibrary();
+                } catch (error) {
+                    alert(error.message);
+                } finally {
+                    button.disabled = false;
+                }
+            });
+            card.querySelector(".analyze-photo").addEventListener("click", async event => {
+                const button = event.currentTarget;
+                const originalText = button.textContent;
+                button.disabled = true;
+                button.textContent = "识别中...";
+                try {
+                    await requestJson("/api/device-library/analyze", {
+                        method: "POST",
+                        body: JSON.stringify({ id })
+                    });
+                    await loadLibrary();
+                } catch (error) {
+                    alert(error.message);
+                } finally {
+                    button.disabled = false;
+                    button.textContent = originalText;
+                }
             });
             card.querySelector(".toggle-hidden").addEventListener("click", async () => {
-                const hidden = card.dataset.hidden !== "1";
-                const res = await requestJson("/api/device-library/update", {
-                    method: "POST",
-                    body: JSON.stringify({ id, hidden })
-                });
-                if (res.ok) loadLibrary();
+                try {
+                    await requestJson("/api/device-library/update", {
+                        method: "POST",
+                        body: JSON.stringify({ id, hidden: card.dataset.hidden !== "1" })
+                    });
+                    await loadLibrary();
+                } catch (error) {
+                    alert(error.message);
+                }
             });
             card.querySelector(".remove-photo").addEventListener("click", async () => {
                 if (!confirm(`从设备照片库移除 ${id}？对应的设备端图片文件也会删除。`)) return;
-                const res = await requestJson("/api/device-library/delete", {
-                    method: "POST",
-                    body: JSON.stringify({ id })
-                });
-                if (res.ok) loadLibrary();
+                try {
+                    await requestJson("/api/device-library/delete", {
+                        method: "POST",
+                        body: JSON.stringify({ id })
+                    });
+                    await loadLibrary();
+                } catch (error) {
+                    alert(error.message);
+                }
             });
         });
+    }
+
+    function sourceLabel(value) {
+        return value === "upload" ? "网页上传" : value === "output" ? "本地图库" : escapeHtml(value || "未知");
     }
 
     function escapeHtml(value) {
@@ -102,7 +272,79 @@ document.addEventListener("DOMContentLoaded", () => {
         return escapeHtml(value).replace(/`/g, "&#96;");
     }
 
-    showHidden.addEventListener("change", loadLibrary);
+    function scheduleLoad() {
+        clearTimeout(loadTimer);
+        loadTimer = setTimeout(loadLibrary, 250);
+    }
+
+    async function runSemanticSearch(jump) {
+        const query = queryInput.value.trim();
+        if (!query) {
+            alert("请先输入自然语言搜索内容。");
+            return;
+        }
+        const button = jump ? semanticJumpButton : semanticSearchButton;
+        const originalText = button.textContent;
+        button.disabled = true;
+        button.textContent = "检索中...";
+        try {
+            const params = new URLSearchParams({ q: query, limit: "10" });
+            if (jump) params.set("jump", "1");
+            const result = await requestJson(`/api/photo/semantic-search?${params.toString()}`);
+            const library = await requestJson("/api/device-library?include_hidden=0");
+            const photoMap = new Map(library.photos.map(photo => [photo.id, photo]));
+            const photos = result.results
+                .map(match => {
+                    const photo = photoMap.get(match.id);
+                    return photo ? { ...photo, semantic_score: match.score } : null;
+                })
+                .filter(Boolean);
+            summary.textContent = jump && result.jumped_to
+                ? `找到 ${photos.length} 张，已请求设备跳转至 ${result.jumped_to}`
+                : `语义检索找到 ${photos.length} 张照片`;
+            renderPhotos(photos);
+        } catch (error) {
+            alert(error.message);
+        } finally {
+            button.disabled = false;
+            button.textContent = originalText;
+        }
+    }
+
+    buildSemanticIndexButton.addEventListener("click", async () => {
+        const originalText = buildSemanticIndexButton.textContent;
+        buildSemanticIndexButton.disabled = true;
+        buildSemanticIndexButton.textContent = "建立中...";
+        try {
+            const result = await requestJson("/api/device-library/semantic-index", {
+                method: "POST",
+                body: JSON.stringify({ force: false })
+            });
+            summary.textContent = `语义索引完成：更新 ${result.updated}，跳过 ${result.skipped}`;
+            await loadLibrary();
+        } catch (error) {
+            alert(error.message);
+        } finally {
+            buildSemanticIndexButton.disabled = false;
+            buildSemanticIndexButton.textContent = originalText;
+        }
+    });
+    semanticSearchButton.addEventListener("click", () => runSemanticSearch(false));
+    semanticJumpButton.addEventListener("click", () => runSemanticSearch(true));
+
+    queryInput.addEventListener("input", scheduleLoad);
+    [showHidden, tagSelect, sourceSelect, dateFrom, dateTo].forEach(control =>
+        control.addEventListener("change", loadLibrary)
+    );
+    resetButton.addEventListener("click", () => {
+        queryInput.value = "";
+        tagSelect.value = "";
+        sourceSelect.value = "";
+        dateFrom.value = "";
+        dateTo.value = "";
+        showHidden.checked = false;
+        loadLibrary();
+    });
     loadLibrary();
 });
 </script>

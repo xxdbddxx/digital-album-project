@@ -101,9 +101,10 @@ static void refresh_photo_list_keep_current(void) {
  * @param idx 照片在列表中的索引
  * @return void
  */
-void fetch_and_display_photo(int idx) {
+static bool fetch_and_display_photo_internal(int idx, bool apply_rotation,
+                                             bool portrait) {
   if (idx < 0 || idx >= g_photo_count)
-    return;
+    return false;
 
   size_t len = 0;
   uint8_t *new_buf = NULL;
@@ -111,29 +112,99 @@ void fetch_and_display_photo(int idx) {
       photo_client_download_rgb565(g_photos[idx].id, &new_buf, &len);
 
   if (ret == ESP_OK && new_buf) {
+    // 先完成网络下载，再旋转并提交新图，避免用户看到“先旋转、后等图片”的停顿。
+    if (apply_rotation) {
+      ui_set_screen_rotation(portrait);
+    }
     // UI 更新需要 LVGL 锁
     if (lvgl_port_lock(-1)) {
       ui_force_dismiss_upload();
-      if (g_photo_buf) {
-        photo_client_free_buf(g_photo_buf);
-      }
+      uint8_t *old_buf = g_photo_buf;
       g_photo_buf = new_buf;
       ui_set_photo_data(g_photo_buf, len, g_photos[idx].caption,
                         g_photos[idx].city, g_photos[idx].date);
+      /*
+       * LVGL 图片描述符只保存像素指针，实际读取发生在刷新阶段。
+       * 持有 LVGL 锁时先替换图片源，再释放旧缓冲区。此时渲染任务
+       * 无法并发访问旧指针，也不能从当前网络任务调用 lv_refr_now，
+       * 否则 RGB 驱动会等待只发给 LVGL 任务的 VSYNC 通知并死锁。
+       */
+      if (old_buf) {
+        photo_client_free_buf(old_buf);
+      }
       lvgl_port_unlock();
+    } else {
+      photo_client_free_buf(new_buf);
+      return false;
     }
     ESP_LOGI(TAG, "Photo %d displayed: %s", idx, g_photos[idx].id);
+    return true;
   } else {
     ESP_LOGE(TAG, "Failed to download photo %d", idx);
     if (lvgl_port_lock(-1)) {
-      if (g_photo_buf) {
-        photo_client_free_buf(g_photo_buf);
-        g_photo_buf = NULL;
-      }
+      uint8_t *old_buf = g_photo_buf;
+      g_photo_buf = NULL;
       ui_show_placeholder();
+      if (old_buf) {
+        photo_client_free_buf(old_buf);
+      }
       lvgl_port_unlock();
     }
+    return false;
   }
+}
+
+void fetch_and_display_photo(int idx) {
+  fetch_and_display_photo_internal(idx, false, false);
+}
+
+static bool switch_to_photo_id_internal(const char *target_id,
+                                        bool apply_rotation, bool portrait) {
+  if (!target_id || target_id[0] == '\0') {
+    return false;
+  }
+
+  refresh_photo_list_keep_current();
+  for (int i = 0; i < g_photo_count; i++) {
+    if (strcmp(g_photos[i].id, target_id) == 0) {
+      g_last_manual_switch_tick = xTaskGetTickCount();
+      g_current_idx = i;
+      if (!fetch_and_display_photo_internal(g_current_idx, apply_rotation,
+                                            portrait)) {
+        return false;
+      }
+      ESP_LOGI(TAG, "Switched to requested photo: %s (index %d)", target_id,
+               i);
+      return true;
+    }
+  }
+
+  if (photo_client_get_tag()[0] != '\0') {
+    ESP_LOGI(TAG, "Target %s not in filtered list; clearing photo tag",
+             target_id);
+    photo_client_set_tag("");
+    refresh_photo_list_keep_current();
+    for (int i = 0; i < g_photo_count; i++) {
+      if (strcmp(g_photos[i].id, target_id) == 0) {
+        g_last_manual_switch_tick = xTaskGetTickCount();
+        g_current_idx = i;
+        if (!fetch_and_display_photo_internal(g_current_idx, apply_rotation,
+                                              portrait)) {
+          return false;
+        }
+        ESP_LOGI(TAG, "Switched to requested photo after refresh: %s",
+                 target_id);
+        return true;
+      }
+    }
+  }
+
+  ESP_LOGW(TAG, "Requested photo ID not found: %s", target_id);
+  return false;
+}
+
+static bool switch_to_photo_id(const char *target_id) {
+  return switch_to_photo_id_internal(target_id, false, false);
 }
 
 /**
@@ -206,8 +277,41 @@ static void upload_check_task(void *param) {
       if (strcmp(cmd.cmd, "switch_photo") == 0) {
         if (strcmp(cmd.target_id, "prev") == 0) {
           ui_voice_prev_photo();
-        } else {
+        } else if (strcmp(cmd.target_id, "next") == 0 ||
+                   cmd.target_id[0] == '\0') {
           ui_voice_next_photo();
+        } else {
+          switch_to_photo_id(cmd.target_id);
+        }
+      } else if (strcmp(cmd.cmd, "set_view") == 0) {
+        bool has_orientation =
+            strcmp(cmd.orientation, "portrait") == 0 ||
+            strcmp(cmd.orientation, "landscape") == 0;
+        bool portrait = strcmp(cmd.orientation, "portrait") == 0;
+        if (has_orientation) {
+          photo_client_set_display_orientation(
+              portrait ? "portrait" : "landscape");
+        }
+
+        bool switched = false;
+        if (cmd.target_id[0] != '\0') {
+          switched = switch_to_photo_id_internal(
+              cmd.target_id, has_orientation, portrait);
+        }
+        if (!switched && has_orientation) {
+          refresh_photo_list_keep_current();
+          if (g_photo_count > 0) {
+            if (g_current_idx < 0 || g_current_idx >= g_photo_count) {
+              g_current_idx = 0;
+            }
+            fetch_and_display_photo_internal(g_current_idx, true, portrait);
+          } else {
+            ui_set_screen_rotation(portrait);
+            if (lvgl_port_lock(-1)) {
+              ui_show_placeholder();
+              lvgl_port_unlock();
+            }
+          }
         }
       } else if (strcmp(cmd.cmd, "toggle_aroma") == 0) {
         aroma_set(cmd.channel, cmd.state);
@@ -233,6 +337,10 @@ static void upload_check_task(void *param) {
     }
 
     loop_cnt++;
+    if ((loop_cnt % 30) == 0) {
+      ESP_LOGI(TAG, "net_daemon alive, stack high-water=%u bytes",
+               (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    }
     if ((loop_cnt % 5) != 0) {
       continue;
     }
@@ -595,5 +703,9 @@ void app_ui_init(void) {
 
   // 4. 启动统一的后台网络守护任务 (Network Daemon, 部署于 Core 0)
   ESP_LOGI(TAG, "Starting unified async network fetch task...");
-  xTaskCreatePinnedToCore(upload_check_task, "net_daemon", 4096, NULL, 1, NULL, 0);
+  BaseType_t net_task_result = xTaskCreatePinnedToCore(
+      upload_check_task, "net_daemon", 8192, NULL, 1, NULL, 0);
+  if (net_task_result != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create net_daemon task");
+  }
 }

@@ -80,6 +80,20 @@ int voice_io_mic_channel(void);
  */
 void voice_io_mic_clear(void);
 
+typedef struct {
+    uint32_t left_average;
+    uint32_t right_average;
+    uint32_t input_peak;
+    uint32_t output_average;
+    uint32_t output_peak;
+    uint32_t frame_count;
+} voice_io_mic_metrics_t;
+
+/**
+ * 获取最近一帧麦克风旁路统计，不消费 WakeNet/ASR 使用的录音数据。
+ */
+esp_err_t voice_io_mic_get_metrics(voice_io_mic_metrics_t *metrics);
+
 /* ── 扬声器 API ─────────────────────────────────────────────── */
 
 /**
@@ -116,8 +130,8 @@ esp_err_t voice_io_spk_play(const uint8_t *data, size_t len);
 esp_err_t voice_io_spk_play_stream(const uint8_t *data, size_t len);
 
 /**
- * 发送静音帧、关断功放、停止 I2S 发送通道。
- * 在流式播放结束后调用，避免扬声器发出噪声。
+ * 等待已提交音频排空，发送 100ms 全 0 PCM，确认底层消费完成后关断功放。
+ * 在流式播放结束后调用，避免尾音截断和 MAX98357A 持续滴答噪声。
  *
  * @return ESP_OK 成功
  */

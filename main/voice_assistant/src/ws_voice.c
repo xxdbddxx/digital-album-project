@@ -26,6 +26,7 @@
  */
 
 #include "ws_voice.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
@@ -39,8 +40,8 @@ static const char *TAG = "ws_voice";
  * 为了强制将 WebSocket 任务栈和接收缓冲分配在 PSRAM 中，以节省极度紧张的内部 RAM，
  * 此处必须将大小设置得大于 16KB。
  */
-#define WS_BUF_SIZE 17000    /* WebSocket 接收缓冲区大小 (大于16KB分配至PSRAM) */
-#define WS_TASK_STACK 17000  /* WebSocket 内部任务栈大小 (大于16KB分配至PSRAM) */
+#define WS_BUF_SIZE 8192
+#define WS_TASK_STACK 8192
 #define WS_RECON_STACK 2048  /* 重连监视任务栈大小              */
 
 /*
@@ -164,8 +165,19 @@ esp_err_t ws_voice_connect(ws_voice_t *ws) {
   esp_websocket_register_events(ws->handle, WEBSOCKET_EVENT_ANY, evt_handler,
                                 ws);
 
+  ESP_LOGI(TAG, "Starting: internal free=%u, largest=%u, stack=%u, buffer=%u",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+                                             MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                      MALLOC_CAP_8BIT),
+           (unsigned)WS_TASK_STACK, (unsigned)WS_BUF_SIZE);
   esp_err_t ret = esp_websocket_client_start(ws->handle);
   if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Start failed: internal free=%u, largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+                                               MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                        MALLOC_CAP_8BIT));
     esp_websocket_client_destroy(ws->handle);
     ws->handle = NULL;
     return ret;

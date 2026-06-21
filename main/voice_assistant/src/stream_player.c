@@ -29,6 +29,86 @@ static esp_err_t _http_event_handle(esp_http_client_event_t *evt) {
   return ESP_OK;
 }
 
+static void pcm_stream_player_task(void *pvParameters) {
+  char *url = (char *)pvParameters;
+  uint8_t *read_buf = heap_caps_malloc(
+      4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!read_buf) {
+    ESP_LOGE(TAG, "Failed to allocate PCM stream buffer");
+    goto cleanup;
+  }
+
+  voice_io_spk_force_reset();
+  esp_http_client_config_t config = {
+      .url = url,
+      .event_handler = _http_event_handle,
+      .timeout_ms = 5000,
+      .buffer_size = 2048,
+      .buffer_size_tx = 512,
+  };
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  g_current_http_client = client;
+  if (!client) {
+    ESP_LOGE(TAG, "Failed to init PCM HTTP client");
+    goto cleanup;
+  }
+  esp_err_t err = esp_http_client_open(client, 0);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to open PCM stream: %s", esp_err_to_name(err));
+    esp_http_client_cleanup(client);
+    g_current_http_client = NULL;
+    goto cleanup;
+  }
+
+  int content_length = esp_http_client_fetch_headers(client);
+  ESP_LOGI(TAG, "PCM stream opened, Content-Length: %d bytes",
+           content_length);
+  while (is_playing) {
+    int read_len =
+        esp_http_client_read(client, (char *)read_buf, 4096);
+    if (read_len < 0) {
+      ESP_LOGE(TAG, "PCM HTTP read error");
+      break;
+    }
+    if (read_len == 0) {
+      if (g_loop_enabled && is_playing) {
+        ESP_LOGI(TAG, "PCM stream completed — looping");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        client = esp_http_client_init(&config);
+        g_current_http_client = client;
+        if (!client || esp_http_client_open(client, 0) != ESP_OK) {
+          ESP_LOGE(TAG, "PCM loop reconnect failed");
+          break;
+        }
+        esp_http_client_fetch_headers(client);
+        continue;
+      }
+      ESP_LOGI(TAG, "PCM stream completed");
+      break;
+    }
+    err = voice_io_spk_play_stream(read_buf, (size_t)read_len);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "PCM I2S push failed: %s", esp_err_to_name(err));
+      break;
+    }
+  }
+
+  esp_http_client_close(client);
+  esp_http_client_cleanup(client);
+  g_current_http_client = NULL;
+  voice_io_spk_stop();
+
+cleanup:
+  if (read_buf)
+    free(read_buf);
+  free(url);
+  is_playing = false;
+  player_task_handle = NULL;
+  ESP_LOGI(TAG, "PCM stream task finished");
+  vTaskDelete(NULL);
+}
+
 static void stream_player_task(void *pvParameters) {
   char *url = (char *)pvParameters;
 
@@ -314,6 +394,34 @@ void stream_player_play_url_with_loop(const char *url, bool loop) {
       is_playing = false;
       free(url_copy);
       return;
+  }
+}
+
+void stream_player_play_pcm_url(const char *url) {
+  stream_player_play_pcm_url_with_loop(url, false);
+}
+
+void stream_player_play_pcm_url_with_loop(const char *url, bool loop) {
+  if (is_playing) {
+    ESP_LOGW(TAG, "Already playing! Please stop first.");
+    return;
+  }
+  g_loop_enabled = loop;
+  char *url_copy = strdup(url);
+  if (!url_copy) {
+    ESP_LOGE(TAG, "No mem for PCM URL copy");
+    return;
+  }
+
+  is_playing = true;
+  BaseType_t ret = xTaskCreatePinnedToCore(
+      pcm_stream_player_task, "pcm_stream", 6144, url_copy, 5,
+      &player_task_handle, 1);
+  if (ret != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create PCM stream task");
+    is_playing = false;
+    player_task_handle = NULL;
+    free(url_copy);
   }
 }
 

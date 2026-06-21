@@ -16,6 +16,8 @@
 
 #include "esp_dsp.h"
 
+#include "esp_aec.h"
+
 #include "esp_heap_caps.h"
 
 #include "esp_log.h"
@@ -56,8 +58,62 @@ static RingbufHandle_t tx_ringbuf = NULL;
 
 static RingbufHandle_t rx_ringbuf = NULL;
 
+static RingbufHandle_t aec_ref_ringbuf = NULL;
+static aec_handle_t *s_aec = NULL;
+static int s_aec_frame_samples = 0;
+
+static volatile uint32_t s_mic_left_average = 0;
+static volatile uint32_t s_mic_right_average = 0;
+static volatile uint32_t s_mic_input_peak = 0;
+static volatile uint32_t s_mic_output_average = 0;
+static volatile uint32_t s_mic_output_peak = 0;
+static volatile uint32_t s_mic_frame_count = 0;
+
+/* 已提交但尚未交给 I2S DMA 的 16kHz PCM 字节数。
+ * 用于播放结束时可靠等待尾音排空，避免固定延时导致截断。 */
+static volatile uint32_t s_tx_pending_bytes = 0;
+
 static uint8_t s_spk_volume =
-    10; // 全局硬件音量 (0~100)，默认 10% 防止瞬间大电流触发功放断电保护
+    60; // 全局硬件音量 (0~100)，语音和本地音频默认使用 60%
+
+static void tx_pending_add(size_t bytes) {
+  __atomic_add_fetch(&s_tx_pending_bytes, (uint32_t)bytes, __ATOMIC_SEQ_CST);
+}
+
+static void tx_pending_consume(size_t bytes) {
+  uint32_t current = __atomic_load_n(&s_tx_pending_bytes, __ATOMIC_SEQ_CST);
+  while (true) {
+    uint32_t next = current > bytes ? current - (uint32_t)bytes : 0;
+    if (__atomic_compare_exchange_n(&s_tx_pending_bytes, &current, next, false,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+      return;
+    }
+  }
+}
+
+static BaseType_t tx_ringbuffer_send(const void *data, size_t bytes,
+                                     TickType_t timeout) {
+  if (!tx_ringbuf || !data || bytes == 0)
+    return pdFALSE;
+
+  /* 先计数再入队，避免高优先级 TX 任务在计数前就消费完成。 */
+  tx_pending_add(bytes);
+  BaseType_t ret =
+      xRingbufferSend(tx_ringbuf, (void *)data, bytes, timeout);
+  if (ret != pdTRUE)
+    tx_pending_consume(bytes);
+  return ret;
+}
+
+static esp_err_t tx_wait_drained(uint32_t timeout_ms) {
+  TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+  while (__atomic_load_n(&s_tx_pending_bytes, __ATOMIC_SEQ_CST) != 0) {
+    if ((int32_t)(xTaskGetTickCount() - deadline) >= 0)
+      return ESP_ERR_TIMEOUT;
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  return ESP_OK;
+}
 
 void voice_io_set_spk_volume(uint8_t vol) {
 
@@ -70,6 +126,37 @@ void voice_io_set_spk_volume(uint8_t vol) {
 }
 
 uint8_t voice_io_get_spk_volume(void) { return s_spk_volume; }
+
+static void aec_ref_read(int16_t *output, size_t sample_count) {
+  size_t requested_bytes = sample_count * sizeof(int16_t);
+  size_t received_bytes = 0;
+
+  memset(output, 0, requested_bytes);
+  if (!aec_ref_ringbuf)
+    return;
+
+  while (received_bytes < requested_bytes) {
+    size_t item_size = 0;
+    void *item = xRingbufferReceiveUpTo(
+        aec_ref_ringbuf, &item_size, 0, requested_bytes - received_bytes);
+    if (!item)
+      break;
+
+    memcpy((uint8_t *)output + received_bytes, item, item_size);
+    received_bytes += item_size;
+    vRingbufferReturnItem(aec_ref_ringbuf, item);
+  }
+}
+
+static void aec_ref_clear(void) {
+  if (!aec_ref_ringbuf)
+    return;
+
+  size_t item_size = 0;
+  void *item = NULL;
+  while ((item = xRingbufferReceive(aec_ref_ringbuf, &item_size, 0)) != NULL)
+    vRingbufferReturnItem(aec_ref_ringbuf, item);
+}
 
 // FIR 滤波器所需资源
 
@@ -168,7 +255,27 @@ static void audio_rx_task(void *args) {
 
                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
-  if (!raw_48k_buf || !pcm_48k_f || !pcm_16k_f || !pcm_16k_buf) {
+  int16_t *ref_16k_buf =
+      heap_caps_aligned_alloc(16, (AUDIO_CHUNK_SAMPLES / 3) * sizeof(int16_t),
+                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  int16_t *aec_mic_frame = NULL;
+  int16_t *aec_ref_frame = NULL;
+  int16_t *aec_out_frame = NULL;
+  int aec_frame_fill = 0;
+
+  if (s_aec && s_aec_frame_samples > 0) {
+    size_t aec_bytes = s_aec_frame_samples * sizeof(int16_t);
+    aec_mic_frame = heap_caps_aligned_alloc(
+        16, aec_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    aec_ref_frame = heap_caps_aligned_alloc(
+        16, aec_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    aec_out_frame = heap_caps_aligned_alloc(
+        16, aec_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+
+  if (!raw_48k_buf || !pcm_48k_f || !pcm_16k_f || !pcm_16k_buf ||
+      !ref_16k_buf ||
+      (s_aec && (!aec_mic_frame || !aec_ref_frame || !aec_out_frame))) {
 
     ESP_LOGE(TAG, "Failed to allocate aligned buffers for RX task");
 
@@ -192,8 +299,8 @@ static void audio_rx_task(void *args) {
     if (ret == ESP_OK &&
         bytes_read == AUDIO_CHUNK_SAMPLES * 2 * sizeof(int32_t)) {
 
-      static int debug_cnt = 0;
       long long l_sum = 0, r_sum = 0;
+      uint32_t input_peak = 0;
 
       // 2. 将 32-bit (高 24 位有效) 转为 16-bit
       // 浮点，并施加数字增益(x4.0)以提高唤醒灵敏度 融合左右声道：防止有些劣质
@@ -208,6 +315,9 @@ static void audio_rx_task(void *args) {
         // 如果左声道是 0，强行用右声道（兼容接反的情况），如果都有声音就混音
         int16_t mix_val =
             (left_val == 0 && right_val != 0) ? right_val : left_val;
+        uint32_t abs_mix = (uint32_t)abs(mix_val);
+        if (abs_mix > input_peak)
+          input_peak = abs_mix;
 
         // 智能噪声门 (Noise Gate) 与适度增益：
         // 底噪极其微弱（±15以内）时，直接归零，彻底消灭环境白噪声和电流声！
@@ -233,6 +343,8 @@ static void audio_rx_task(void *args) {
 
       // 4. 浮点转回 16-bit PCM（tanh 软限制，避免硬切爆破音）
 
+      uint64_t output_sum = 0;
+      uint32_t output_peak = 0;
       for (int i = 0; i < AUDIO_CHUNK_SAMPLES / 3; i++) {
 
         float val = pcm_16k_f[i];
@@ -250,13 +362,53 @@ static void audio_rx_task(void *args) {
           norm = -3.0f;
         float limited = tanhf(norm) * 32767.0f;
         pcm_16k_buf[i] = (int16_t)limited;
+        uint32_t abs_output = (uint32_t)abs(pcm_16k_buf[i]);
+        output_sum += abs_output;
+        if (abs_output > output_peak)
+          output_peak = abs_output;
       }
+
+      s_mic_left_average = (uint32_t)(l_sum / AUDIO_CHUNK_SAMPLES);
+      s_mic_right_average = (uint32_t)(r_sum / AUDIO_CHUNK_SAMPLES);
+      s_mic_input_peak = input_peak;
+      s_mic_output_average =
+          (uint32_t)(output_sum / (AUDIO_CHUNK_SAMPLES / 3));
+      s_mic_output_peak = output_peak;
+      s_mic_frame_count++;
 
       // 5. 送入 PSRAM 缓冲池，让上层网络慢慢消费
 
-      xRingbufferSend(rx_ringbuf, pcm_16k_buf,
+      const int chunk_samples = AUDIO_CHUNK_SAMPLES / 3;
+      if (!s_aec || !s_amp_enabled) {
+        aec_frame_fill = 0;
+        aec_ref_clear();
+        xRingbufferSend(rx_ringbuf, pcm_16k_buf,
+                        chunk_samples * sizeof(int16_t), 0);
+        continue;
+      }
 
-                      (AUDIO_CHUNK_SAMPLES / 3) * sizeof(int16_t), 0);
+      aec_ref_read(ref_16k_buf, chunk_samples);
+      int chunk_offset = 0;
+      while (chunk_offset < chunk_samples) {
+        int copy_samples = s_aec_frame_samples - aec_frame_fill;
+        int remaining = chunk_samples - chunk_offset;
+        if (copy_samples > remaining)
+          copy_samples = remaining;
+
+        memcpy(aec_mic_frame + aec_frame_fill, pcm_16k_buf + chunk_offset,
+               copy_samples * sizeof(int16_t));
+        memcpy(aec_ref_frame + aec_frame_fill, ref_16k_buf + chunk_offset,
+               copy_samples * sizeof(int16_t));
+        aec_frame_fill += copy_samples;
+        chunk_offset += copy_samples;
+
+        if (aec_frame_fill == s_aec_frame_samples) {
+          aec_process(s_aec, aec_mic_frame, aec_ref_frame, aec_out_frame);
+          xRingbufferSend(rx_ringbuf, aec_out_frame,
+                          s_aec_frame_samples * sizeof(int16_t), 0);
+          aec_frame_fill = 0;
+        }
+      }
     }
   }
 }
@@ -278,7 +430,11 @@ static void audio_tx_task(void *args) {
   int32_t *upmix_buf =
       heap_caps_malloc(6144, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
-  if (!upmix_buf) {
+  int16_t *aec_ref_buf =
+      heap_caps_aligned_alloc(16, 256 * sizeof(int16_t),
+                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+  if (!upmix_buf || !aec_ref_buf) {
 
     ESP_LOGE(TAG, "Failed to allocate upmix_buf in PSRAM for TX task");
 
@@ -330,6 +486,8 @@ static void audio_tx_task(void *args) {
 
         assembled = (int16_t)((int32_t)assembled * s_spk_volume / 100);
 
+        aec_ref_buf[sample_cnt] = assembled;
+
         int32_t val = ((int32_t)assembled) << 16;
 
         upmix_buf[sample_cnt * 6 + 0] = val;
@@ -359,6 +517,8 @@ static void audio_tx_task(void *args) {
         // 硬件级全局音量控制
 
         val_16 = (int16_t)((int32_t)val_16 * s_spk_volume / 100);
+
+        aec_ref_buf[sample_cnt] = val_16;
 
         int32_t val = ((int32_t)val_16) << 16;
 
@@ -405,12 +565,16 @@ static void audio_tx_task(void *args) {
             ESP_LOGW(TAG, "I2S DMA Write Failed (%lu): %s",
                      (unsigned long)i2s_err_count, esp_err_to_name(err));
           }
+        } else if (aec_ref_ringbuf) {
+          xRingbufferSend(aec_ref_ringbuf, aec_ref_buf,
+                          sample_cnt * sizeof(int16_t), 0);
         }
 
         total_samples_tx += sample_cnt;
       }
 
       vRingbufferReturnItem(tx_ringbuf, (void *)raw_data);
+      tx_pending_consume(size);
     }
 
     // 每 30 秒打印一次消费速率
@@ -470,7 +634,29 @@ static esp_err_t voice_io_shared_init(uint32_t unused_rate) {
 
       xRingbufferCreateStatic(rb_size, RINGBUF_TYPE_BYTEBUF, rx_buf, rx_struct);
 
+  size_t aec_ref_rb_size = 16 * 1024;
+  uint8_t *aec_ref_storage =
+      heap_caps_malloc(aec_ref_rb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  StaticRingbuffer_t *aec_ref_struct = heap_caps_malloc(
+      sizeof(StaticRingbuffer_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (aec_ref_storage && aec_ref_struct) {
+    aec_ref_ringbuf =
+        xRingbufferCreateStatic(aec_ref_rb_size, RINGBUF_TYPE_BYTEBUF,
+                                aec_ref_storage, aec_ref_struct);
+  }
+
   init_fir_decim();
+
+  if (aec_ref_ringbuf)
+    s_aec = aec_create(16000, 4, 1, AEC_MODE_SR_LOW_COST);
+  if (s_aec) {
+    s_aec_frame_samples = aec_get_chunksize(s_aec);
+    aec_set_nlp_level(s_aec, AEC_NLP_LEVEL_AGGR);
+    ESP_LOGI(TAG, "AEC initialized: frame=%d samples, volume=%u%%",
+             s_aec_frame_samples, s_spk_volume);
+  } else {
+    ESP_LOGW(TAG, "AEC/reference buffer unavailable; using processed PCM");
+  }
 
   /* 1. 初始化 MAX98357A SD_MODE 功放使能管脚（ESP32 原生 GPIO 直驱）
 
@@ -550,9 +736,9 @@ static esp_err_t voice_io_shared_init(uint32_t unused_rate) {
 
               .mclk = I2S_GPIO_UNUSED,
 
-              .bclk = VA_MIC_SCK_PIN,
+              .bclk = VA_SPK_BCLK_PIN,
 
-              .ws = VA_MIC_WS_PIN,
+              .ws = VA_SPK_LRCK_PIN,
 
               .dout = VA_SPK_DIN_PIN,
 
@@ -587,11 +773,11 @@ static esp_err_t voice_io_shared_init(uint32_t unused_rate) {
   rx_std_cfg.slot_cfg.slot_mask =
       I2S_STD_SLOT_BOTH; // 启用双声道物理掩码，让 ESP-IDF 计算标准的 64 BCLK
 
-  // 共享时钟全双工配置下，RX 麦克风作为主通道，占用物理引脚提供持续时钟
+  // RX/TX 共用功放侧配置的 BCLK/WS；麦克风只使用独立的数据输入脚。
 
-  rx_std_cfg.gpio_cfg.bclk = VA_MIC_SCK_PIN;
+  rx_std_cfg.gpio_cfg.bclk = VA_SPK_BCLK_PIN;
 
-  rx_std_cfg.gpio_cfg.ws = VA_MIC_WS_PIN;
+  rx_std_cfg.gpio_cfg.ws = VA_SPK_LRCK_PIN;
 
   rx_std_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
 
@@ -723,6 +909,19 @@ void voice_io_mic_clear(void) {
   ESP_LOGI(TAG, "Mic RX ringbuf cleared");
 }
 
+esp_err_t voice_io_mic_get_metrics(voice_io_mic_metrics_t *metrics) {
+  if (!metrics)
+    return ESP_ERR_INVALID_ARG;
+
+  metrics->left_average = s_mic_left_average;
+  metrics->right_average = s_mic_right_average;
+  metrics->input_peak = s_mic_input_peak;
+  metrics->output_average = s_mic_output_average;
+  metrics->output_peak = s_mic_output_peak;
+  metrics->frame_count = s_mic_frame_count;
+  return metrics->frame_count > 0 ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
 /* ── 扬声器 API (推入缓冲池) ───────────────────────── */
 
 esp_err_t voice_io_spk_init(uint32_t sample_rate, int channel,
@@ -778,7 +977,7 @@ static esp_err_t ensure_tx_on(void) {
     int16_t silence[240]; /* 16kHz 30ms = 480 采样 */
     for (int i = 0; i < 240; i++)
       silence[i] = 0;
-    xRingbufferSend(tx_ringbuf, silence, 240 * 2, pdMS_TO_TICKS(50));
+    tx_ringbuffer_send(silence, 240 * 2, pdMS_TO_TICKS(50));
   }
 
   s_amp_enabled = true;
@@ -854,9 +1053,8 @@ esp_err_t voice_io_spk_play_stream(const uint8_t *data, size_t len) {
 
       to_send = 4096;
 
-    if (xRingbufferSend(tx_ringbuf, (void *)(data + sent), to_send,
-
-                        pdMS_TO_TICKS(200)) == pdTRUE) {
+    if (tx_ringbuffer_send(data + sent, to_send,
+                           pdMS_TO_TICKS(200)) == pdTRUE) {
 
       sent += to_send;
 
@@ -875,13 +1073,32 @@ esp_err_t voice_io_spk_stop(void) {
 
     return ESP_OK;
 
-  /* 播放结束：输出 50ms 静音淡出 → 避免突然切断产生爆破声 */
+  /* 先等待所有语音尾部进入 I2S DMA，不能提前清 RingBuffer。 */
+  esp_err_t ret = tx_wait_drained(3000);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Timed out waiting for audio tail to drain");
+  }
+
+  /* MAX98357A 停止前必须实际输出一段全 0 PCM。
+   * 1600 samples @ 16kHz = 100ms；TX 任务会转换为 48kHz 双声道 I2S。 */
   if (tx_ringbuf) {
-    int16_t silence[400]; /* 16kHz 50ms = 800 采样 */
-    for (int i = 0; i < 400; i++)
-      silence[i] = 0;
-    xRingbufferSend(tx_ringbuf, silence, 400 * 2, pdMS_TO_TICKS(50));
-    vTaskDelay(pdMS_TO_TICKS(50)); /* 等静音帧播完 */
+    int16_t silence[1600] = {0};
+    if (tx_ringbuffer_send(silence, sizeof(silence),
+                           pdMS_TO_TICKS(250)) == pdTRUE) {
+      esp_err_t silence_ret = tx_wait_drained(1000);
+      if (silence_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Timed out waiting for zero PCM to drain");
+        if (ret == ESP_OK)
+          ret = silence_ret;
+      }
+      /* i2s_channel_write() 返回时数据可能仍在 DMA 描述符中，
+       * 留足 100ms 让全零帧真正出现在 BCLK/WS/DOUT 上。 */
+      vTaskDelay(pdMS_TO_TICKS(120));
+    } else {
+      ESP_LOGW(TAG, "Failed to enqueue zero PCM during speaker stop");
+      if (ret == ESP_OK)
+        ret = ESP_ERR_TIMEOUT;
+    }
   }
 
 #if VA_SPK_SD_PIN >= 0
@@ -900,16 +1117,18 @@ esp_err_t voice_io_spk_stop(void) {
 
   s_leftover_byte = 0;
 
-  // 清空 Ringbuffer 残余数据
+  // 异常超时情况下才可能有残余数据；清理并同步待处理计数。
   if (tx_ringbuf) {
     size_t size;
     void *item;
     while ((item = xRingbufferReceive(tx_ringbuf, &size, 0)) != NULL) {
       vRingbufferReturnItem(tx_ringbuf, item);
+      tx_pending_consume(size);
     }
   }
 
-  ESP_LOGI(TAG, "Speaker stopped, buffers flushed");
+  __atomic_store_n(&s_tx_pending_bytes, 0, __ATOMIC_SEQ_CST);
+  ESP_LOGI(TAG, "Speaker stopped after zero-PCM drain");
 
-  return ESP_OK;
+  return ret;
 }

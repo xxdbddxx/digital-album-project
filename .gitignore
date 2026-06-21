@@ -55,6 +55,9 @@ CTestTestfile.cmake
 __pycache__/
 *.egg-info/
 dist/
+.env
+.env.local
+backend/.env.local
 
 # Virtual environment folders
 venv/
@@ -112,6 +115,7 @@ backend/output/
 
 # Large local media/model assets
 backend/music/*.mp3
+backend/music/*_16k_mono.pcm
 backend/services/*.onnx
 backend/services/*.onnx.json
 backend/services/rhysp/piper-voices/

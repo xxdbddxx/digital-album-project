@@ -263,8 +263,8 @@ bool audio_buf_stream_feed(audio_buf_t *ab, const uint8_t *data, size_t len)
 }
 
 /*
- * 流式播放收尾: 播放环形缓冲区中剩余的不足一块的尾部数据，
- * 然后关闭流式状态。
+ * 流式播放收尾: 提交不足一块的尾部数据，等待底层播放队列排空，
+ * 输出全 0 PCM 后关闭 MAX98357A。
  */
 void audio_buf_stream_finish(audio_buf_t *ab)
 {
@@ -275,10 +275,23 @@ void audio_buf_stream_finish(audio_buf_t *ab)
         uint8_t *tail = malloc(remaining);
         if (tail) {
             stream_read_chunk(ab, tail, remaining);
-            voice_io_spk_play(tail, remaining);  /* 最后一次性播放，play 内部会关功放 */
+            esp_err_t tail_ret = voice_io_spk_play_stream(tail, remaining);
+            if (tail_ret != ESP_OK) {
+                ESP_LOGW(TAG, "failed to submit stream tail: %s",
+                         esp_err_to_name(tail_ret));
+            }
             free(tail);
+        } else {
+            ESP_LOGE(TAG, "failed to allocate %zu-byte stream tail", remaining);
         }
     }
+
+    esp_err_t stop_ret = voice_io_spk_stop();
+    if (stop_ret != ESP_OK) {
+        ESP_LOGW(TAG, "speaker stop after stream failed: %s",
+                 esp_err_to_name(stop_ret));
+    }
+
     ab->streaming    = false;
     ab->is_playing  = false;
     ab->stream_write = 0;

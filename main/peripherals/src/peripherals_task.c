@@ -12,6 +12,7 @@
 #include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "he30.h"
+#define ENABLE_AHT20_FEATURES 0
 #define ENABLE_MPU6050_FEATURES 0
 #if ENABLE_MPU6050_FEATURES
 #include "mpu6050_sensor.h"
@@ -22,7 +23,9 @@
 #include "voice_assistant.h"
 #include "voice_io.h"
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -31,6 +34,7 @@
 static TaskHandle_t audio_task_handle = NULL;
 static volatile bool audio_is_playing = false;
 static bool s_audio_inited = false;
+static bool s_mic_diagnostics_enabled = false;
 
 static int s_aroma_level[3] = {3, 3, 3};
 static bool s_aroma_target[3] = {false, false, false};
@@ -79,6 +83,9 @@ int peripherals_mist_channel_from_string(const char *ch_str) {
 }
 
 static void audio_test_task(void *arg) {
+  uint32_t duration_ms = (uint32_t)(uintptr_t)arg;
+  TickType_t started_at = xTaskGetTickCount();
+
   // 播放测试 Beep 音前，强制对功放做冷启动物理复位以防抖和防止锁死
   voice_io_spk_force_reset();
 
@@ -94,12 +101,21 @@ static void audio_test_task(void *arg) {
     beep[i] = (int16_t)(10000.0f * sinf(2.0f * M_PI * 440.0f * i / 16000.0f));
   }
 
-  ESP_LOGI("audio_test", "Audio task started, volume=%d%%, looping...",
-           voice_io_get_spk_volume());
+  ESP_LOGI("audio_test", "Audio task started, volume=%d%%, duration=%s",
+           voice_io_get_spk_volume(),
+           duration_ms > 0 ? "limited" : "manual");
   uint32_t loops = 0;
   // 360 samples / 16000 Hz = 22.5ms，等待 22ms 匹配消费速率防止 buffer 爆满
   const TickType_t chunk_delay = pdMS_TO_TICKS(22);
   while (audio_is_playing) {
+    if (duration_ms > 0 &&
+        xTaskGetTickCount() - started_at >= pdMS_TO_TICKS(duration_ms)) {
+      ESP_LOGI("audio_test", "Automatic speaker test completed after %lu ms",
+               (unsigned long)duration_ms);
+      audio_is_playing = false;
+      break;
+    }
+
     esp_err_t err = voice_io_spk_play_stream((const uint8_t *)beep, 720);
     if (err == ESP_ERR_TIMEOUT) {
       // Ringbuf 消费不及，延长等待
@@ -122,6 +138,82 @@ static void audio_test_task(void *arg) {
   ESP_LOGI("audio_test", "Audio task stopped, cleaning up...");
   voice_io_spk_stop();
   free(beep);
+  audio_task_handle = NULL;
+  vTaskDelete(NULL);
+}
+
+static void __attribute__((unused)) melody_test_task(void *arg) {
+  (void)arg;
+  enum { CHUNK_SAMPLES = 320 }; // 16kHz 下 20ms
+  static const uint16_t notes_hz[] = {
+      262, 262, 392, 392, 440, 440, 392,
+      349, 349, 330, 330, 294, 294, 262,
+  };
+  static const uint16_t durations_ms[] = {
+      300, 300, 300, 300, 300, 300, 600,
+      300, 300, 300, 300, 300, 300, 600,
+  };
+
+  voice_io_spk_force_reset();
+  int16_t *pcm = heap_caps_malloc(
+      CHUNK_SAMPLES * sizeof(int16_t),
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!pcm) {
+    ESP_LOGE("audio_test", "Failed to allocate local melody buffer");
+    audio_is_playing = false;
+    audio_task_handle = NULL;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  ESP_LOGI("audio_test", "Local melody started, volume=%d%%",
+           voice_io_get_spk_volume());
+  float phase = 0.0f;
+  for (size_t note = 0;
+       note < sizeof(notes_hz) / sizeof(notes_hz[0]) && audio_is_playing;
+       note++) {
+    const int chunks = durations_ms[note] / 20;
+    const float phase_step =
+        2.0f * M_PI * (float)notes_hz[note] / 16000.0f;
+    for (int chunk = 0; chunk < chunks && audio_is_playing; chunk++) {
+      for (int i = 0; i < CHUNK_SAMPLES; i++) {
+        float envelope = 1.0f;
+        if (chunk == 0 && i < 80)
+          envelope = (float)i / 80.0f;
+        if (chunk == chunks - 1 && i >= CHUNK_SAMPLES - 80)
+          envelope = (float)(CHUNK_SAMPLES - 1 - i) / 80.0f;
+        pcm[i] = (int16_t)(7000.0f * envelope * sinf(phase));
+        phase += phase_step;
+        if (phase >= 2.0f * M_PI)
+          phase -= 2.0f * M_PI;
+      }
+      esp_err_t err = voice_io_spk_play_stream(
+          (const uint8_t *)pcm, sizeof(int16_t) * CHUNK_SAMPLES);
+      if (err != ESP_OK) {
+        ESP_LOGE("audio_test", "Local melody output failed: %s",
+                 esp_err_to_name(err));
+        audio_is_playing = false;
+        break;
+      }
+    }
+
+    // 每个音符之间写入真实静音，而不是让 I2S 队列空转。
+    memset(pcm, 0, sizeof(int16_t) * CHUNK_SAMPLES);
+    voice_io_spk_play_stream(
+        (const uint8_t *)pcm, sizeof(int16_t) * CHUNK_SAMPLES);
+  }
+
+  // 末尾加入 300ms 全零 PCM，防止最后一个音符突断。
+  memset(pcm, 0, sizeof(int16_t) * CHUNK_SAMPLES);
+  for (int i = 0; i < 15; i++) {
+    voice_io_spk_play_stream(
+        (const uint8_t *)pcm, sizeof(int16_t) * CHUNK_SAMPLES);
+  }
+  audio_is_playing = false;
+
+  ESP_LOGI("audio_test", "Local melody stopped, cleaning up...");
+  voice_io_spk_stop();
+  free(pcm);
   audio_task_handle = NULL;
   vTaskDelete(NULL);
 }
@@ -201,9 +293,13 @@ void app_peripherals(void *param) {
   (void)param;
   i2c_bus_mutex_init();
 
+#if ENABLE_AHT20_FEATURES
   if (i2c_sensor_aht20_init() != ESP_OK) {
     ESP_LOGE("peripherals", "AHT20 init failed!");
   }
+#else
+  ESP_LOGI("peripherals", "AHT20 disabled for current testing");
+#endif
   if (pcf8574_io_init() != ESP_OK) {
     ESP_LOGE("peripherals", "PCF8574 init failed!");
   }
@@ -227,11 +323,13 @@ void app_peripherals(void *param) {
     peripheral_aroma_process(&tick_count);
     
     // 2. 轮询传感器并更新内部数据缓存
+#if ENABLE_AHT20_FEATURES
     static int aht20_tick = 0;
     if (++aht20_tick >= 10) { // 300ms * 10 = 3s
       peripheral_aht20();
       aht20_tick = 0;
     }
+#endif
 #if ENABLE_MPU6050_FEATURES
     peripheral_mpu6050();
 
@@ -254,26 +352,28 @@ static void uart_ctrl_task(void *arg) {
 
   // 延时 3 秒，等 Wi-Fi 和屏幕初始化完毕
   vTaskDelay(pdMS_TO_TICKS(3000));
-  
-  // =========================================================================
-  // 屏蔽开机自动播放 440Hz 蜂鸣声的测试代码，以防它干扰麦克风监听唤醒词！
-  // =========================================================================
-  /*
+
+#if CONFIG_VA_AUTO_SPK_TEST
   ESP_LOGI("uart_ctrl", "Auto-starting audio test Beep (440Hz Sine)...");
   esp_err_t err = voice_io_spk_init(48000, 1, 16);
   if (err == ESP_OK) {
+    voice_io_set_spk_volume(10);
     audio_is_playing = true;
-    BaseType_t ret = xTaskCreate(audio_test_task, "audio_test", 4096, NULL, 5,
-                                 &audio_task_handle);
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(
+        audio_test_task, "audio_test", 6144,
+        (void *)(uintptr_t)CONFIG_VA_AUTO_SPK_TEST_DURATION_MS, 5,
+        &audio_task_handle, tskNO_AFFINITY,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ret == pdPASS) {
       ESP_LOGI("uart_ctrl", "audio_test_task auto-created successfully.");
     } else {
       ESP_LOGE("uart_ctrl", "Failed to auto-create audio_test_task: %d", ret);
+      audio_is_playing = false;
     }
   } else {
     ESP_LOGE("uart_ctrl", "Audio init failed on startup");
   }
-  */
+#endif
 
   while (1) {
     int c = getchar();
@@ -347,15 +447,16 @@ static void uart_ctrl_task(void *arg) {
         break;
       }
       case '6': {
-        static bool stream_is_playing = false;
-        if (stream_is_playing) {
-          ESP_LOGI("uart_ctrl", "Stopping MP3 Stream...");
+        if (stream_player_is_playing()) {
+          ESP_LOGI("uart_ctrl", "Stopping real music PCM stream...");
           stream_player_stop();
-          stream_is_playing = false;
         } else {
-          char url[128];
-          snprintf(url, sizeof(url), "%s/music/test.mp3", CONFIG_SERVER_URL);
-          ESP_LOGI("uart_ctrl", "Starting MP3 Stream (%s)...", url);
+          char url[160];
+          snprintf(url, sizeof(url),
+                   "%s/music/happy_pop_1_16k_mono.pcm",
+                   CONFIG_SERVER_URL);
+          ESP_LOGI("uart_ctrl", "Starting real music PCM stream (%s)...",
+                   url);
           if (!s_audio_inited) {
             esp_err_t err = voice_io_spk_init(48000, 1, 16);
             if (err == ESP_OK) {
@@ -365,11 +466,8 @@ static void uart_ctrl_task(void *arg) {
               break;
             }
           }
-          if (voice_io_get_spk_volume() < 50) {
-            voice_io_set_spk_volume(50);
-          }
-          stream_is_playing = true;
-          stream_player_play_url(url);
+          voice_io_set_spk_volume(60);
+          stream_player_play_pcm_url(url);
         }
         break;
       }
@@ -378,6 +476,11 @@ static void uart_ctrl_task(void *arg) {
         va_force_wake();
         break;
       }
+      case '8':
+        s_mic_diagnostics_enabled = !s_mic_diagnostics_enabled;
+        ESP_LOGI("uart_ctrl", "Microphone diagnostics %s",
+                 s_mic_diagnostics_enabled ? "ON" : "OFF");
+        break;
       case ' ':
         t_state[0] = t_state[1] = t_state[2] = false;
         he30_set_target(0, false);
@@ -407,6 +510,30 @@ static void uart_ctrl_task(void *arg) {
       }
       default:
         break;
+      }
+    }
+
+    if (s_mic_diagnostics_enabled) {
+      static TickType_t last_mic_log = 0;
+      TickType_t now = xTaskGetTickCount();
+      if (now - last_mic_log >= pdMS_TO_TICKS(500)) {
+        voice_io_mic_metrics_t metrics;
+        esp_err_t ret = voice_io_mic_get_metrics(&metrics);
+        if (ret == ESP_OK) {
+          ESP_LOGI(
+              "mic_test",
+              "L=%lu R=%lu raw_peak=%lu processed=%lu peak=%lu frames=%lu",
+              (unsigned long)metrics.left_average,
+              (unsigned long)metrics.right_average,
+              (unsigned long)metrics.input_peak,
+              (unsigned long)metrics.output_average,
+              (unsigned long)metrics.output_peak,
+              (unsigned long)metrics.frame_count);
+        } else {
+          ESP_LOGW("mic_test", "No microphone frames: %s",
+                   esp_err_to_name(ret));
+        }
+        last_mic_log = now;
       }
     }
     vTaskDelay(pdMS_TO_TICKS(50));
