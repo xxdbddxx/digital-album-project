@@ -74,6 +74,15 @@ class MusicRoutingTests(unittest.TestCase):
 
         self.assertEqual(emotion, "empathic")
 
+    def test_preserves_old_dialogue_emotion_compatibility(self):
+        from backend.services.emotion.streaming import extract_user_emotion
+        response = (
+            '{"dialogue":{"tts_text":"我会陪着你。","emotion":"empathic"},'
+            '"action":{"audio":{"command":"keep"}}}'
+        )
+        self.assertIsNone(extract_user_emotion(response))
+        self.assertEqual(voice_server._extract_dialogue_emotion(response), "empathic")
+
 
 if __name__ == "__main__":
     unittest.main()
