@@ -122,3 +122,5 @@ backend/services/rhysp/piper-voices/
 backend/services/test_*.pcm
 
 .worktrees/
+
+.superpowers/
