@@ -120,3 +120,5 @@ backend/services/*.onnx
 backend/services/*.onnx.json
 backend/services/rhysp/piper-voices/
 backend/services/test_*.pcm
+
+.worktrees/
