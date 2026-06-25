@@ -124,3 +124,8 @@ backend/services/test_*.pcm
 .worktrees/
 
 .superpowers/
+
+# Emotion Replay Fixtures
+backend/tests/fixtures/emotion/*.wav
+backend/tests/fixtures/emotion/*.jsonl
+backend/tests/fixtures/emotion/*.json
