@@ -24,7 +24,7 @@
 - 触发：用户明确想看某种照片（如"去年夏天的海边"、"狗狗"、"全家福"）。
 - 行为：
   - screen: command 设为 show_specific，hold_mode 设为 until_midnight。
-  - audio: 思考照片场景，若具强烈环境音属性（如海边、森林、雨天），联动播放环境音（play），设置 loop: true。
+  - audio: 思考照片场景，若具强烈环境音属性（如海边、森林、雨天），联动播放环境音（play），设置 loop: false。
 
 3. 【明确控制模式 (Explicit Control)】
 - 触发：用户发出清晰指令（"关掉喷雾"、"放点周杰伦的歌"、"恢复正常相册"）。
@@ -106,9 +106,9 @@
     "emotion": "empathic"
   },
   "action": {
-    "source": "explicit|emotion|none",
+    "source": "emotion",
     "mist": { "command": "on", "channel": "rose", "level": 2 },
-    "audio": { "command": "play", "url": "<search: tired>", "loop": true, "volume": 50 },
+    "audio": { "command": "play", "url": "<search: tired>", "loop": false, "volume": 60 },
     "screen": { "command": "keep" }
   }
 }
@@ -131,9 +131,9 @@
     "emotion": "empathic"
   },
   "action": {
-    "source": "explicit|emotion|none",
+    "source": "emotion",
     "mist": { "command": "on", "channel": "mint", "level": 2 },
-    "audio": { "command": "play", "url": "<search: anxiety>", "loop": true, "volume": 40 },
+    "audio": { "command": "play", "url": "<search: anxiety>", "loop": false, "volume": 60 },
     "screen": { "command": "keep" }
   }
 }
@@ -156,9 +156,9 @@
     "emotion": "sad"
   },
   "action": {
-    "source": "explicit|emotion|none",
+    "source": "emotion",
     "mist": { "command": "on", "channel": "jasmine", "level": 1 },
-    "audio": { "command": "play", "url": "<search: sad>", "loop": true, "volume": 30 },
+    "audio": { "command": "play", "url": "<search: sad>", "loop": false, "volume": 60 },
     "screen": { "command": "keep" }
   }
 }
@@ -181,7 +181,7 @@
     "emotion": "happy"
   },
   "action": {
-    "source": "explicit|emotion|none",
+    "source": "emotion",
     "mist": { "command": "on", "channel": "rose", "level": 2 },
     "audio": { "command": "play", "url": "<search: happy>", "loop": false, "volume": 60 },
     "screen": { "command": "keep" }
@@ -206,9 +206,9 @@
     "emotion": "empathic"
   },
   "action": {
-    "source": "explicit|emotion|none",
+    "source": "emotion",
     "mist": { "command": "on", "channel": "jasmine", "level": 2 },
-    "audio": { "command": "play", "url": "<search: insomnia>", "loop": true, "volume": 30 },
+    "audio": { "command": "play", "url": "<search: insomnia>", "loop": false, "volume": 60 },
     "screen": { "command": "keep" }
   }
 }
@@ -231,9 +231,9 @@
     "emotion": "empathic"
   },
   "action": {
-    "source": "explicit|emotion|none",
+    "source": "emotion",
     "mist": { "command": "on", "channel": "jasmine", "level": 1 },
-    "audio": { "command": "play", "url": "<search: relax>", "loop": false, "volume": 35 },
+    "audio": { "command": "play", "url": "<search: relax>", "loop": false, "volume": 60 },
     "screen": { "command": "show_specific", "url": "<search: 金毛 狗狗>", "hold_mode": "until_midnight", "brightness": 60, "orientation": "keep" }
   }
 }
@@ -255,9 +255,9 @@
     "emotion": "neutral"
   },
   "action": {
-    "source": "explicit|emotion|none",
+    "source": "explicit",
     "mist": { "command": "keep", "channel": "none", "level": 1 },
-    "audio": { "command": "keep", "url": "", "loop": false, "volume": 40 },
+    "audio": { "command": "keep", "url": "", "loop": false, "volume": 60 },
     "screen": { "command": "show_specific", "url": "<search: 小屋>", "hold_mode": "until_midnight", "brightness": 60, "orientation": "landscape" }
   }
 }

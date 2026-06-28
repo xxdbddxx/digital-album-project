@@ -106,16 +106,23 @@ class EmotionConfig:
         def flag(name: str, default: bool) -> bool:
             value = str(values.get(name, str(default))).strip().lower()
             return value in {"1", "true", "yes", "on"}
+        def safe_int(name: str, default: int) -> int:
+            try: return int(values.get(name, default))
+            except (ValueError, TypeError): return default
+        def safe_float(name: str, default: float) -> float:
+            try: return float(values.get(name, default))
+            except (ValueError, TypeError): return default
+
         return cls(
             enabled=flag("EMOTION_ENABLED", True),
             acoustic_provider=str(values.get("EMOTION_ACOUSTIC_PROVIDER", "dashscope")),
             acoustic_model=str(values.get("EMOTION_ACOUSTIC_MODEL", "qwen3-omni-30b-a3b-captioner")),
-            acoustic_timeout_ms=int(values.get("EMOTION_ACOUSTIC_TIMEOUT_MS", 400)),
+            acoustic_timeout_ms=safe_int("EMOTION_ACOUSTIC_TIMEOUT_MS", 400),
             demo_mode=flag("EMOTION_DEMO_MODE", True),
-            session_window_turns=max(3, min(5, int(values.get("EMOTION_SESSION_WINDOW_TURNS", 5)))),
-            ui_threshold=float(values.get("EMOTION_UI_THRESHOLD", 0.45)),
-            response_threshold=float(values.get("EMOTION_RESPONSE_THRESHOLD", 0.65)),
-            action_threshold=float(values.get("EMOTION_ACTION_THRESHOLD", 0.80)),
-            intervention_cooldown_sec=int(values.get("EMOTION_INTERVENTION_COOLDOWN_SEC", 300)),
+            session_window_turns=max(3, min(5, safe_int("EMOTION_SESSION_WINDOW_TURNS", 5))),
+            ui_threshold=safe_float("EMOTION_UI_THRESHOLD", 0.45),
+            response_threshold=safe_float("EMOTION_RESPONSE_THRESHOLD", 0.65),
+            action_threshold=safe_float("EMOTION_ACTION_THRESHOLD", 0.80),
+            intervention_cooldown_sec=safe_int("EMOTION_INTERVENTION_COOLDOWN_SEC", 300),
             tts_style_enabled=flag("EMOTION_TTS_STYLE_ENABLED", True),
         )

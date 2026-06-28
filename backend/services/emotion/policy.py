@@ -34,7 +34,7 @@ def speech_rate_for(label: EmotionLabel) -> float:
 
 @dataclass
 class PolicyContext:
-    fused: FusedEmotion
+    fused: FusedEmotion | None
     is_demo_mode: bool
     action_threshold: float
     has_cooldown: bool
@@ -43,6 +43,7 @@ class PolicyContext:
 @dataclass
 class PolicyDecision:
     authorized_json: dict[str, Any]
+    reasons: list[str]
 
 def authorize_actions(llm_json: dict[str, Any], context: PolicyContext) -> PolicyDecision:
     result = copy.deepcopy(llm_json)
@@ -51,41 +52,53 @@ def authorize_actions(llm_json: dict[str, Any], context: PolicyContext) -> Polic
     source = action.get("source")
     
     if source == "explicit":
-        return PolicyDecision(authorized_json=result)
+        return PolicyDecision(authorized_json=result, reasons=["Explicit command passed unchanged"])
         
     if source == "emotion":
-        authorized = True
-        
-        if context.fused.confidence < context.action_threshold:
-            authorized = False
-        if EmotionSource.ACOUSTIC not in context.fused.modalities or EmotionSource.SEMANTIC not in context.fused.modalities:
-            authorized = False
-        if context.fused.mixed:
-            authorized = False
+        reasons = []
+
+        if context.fused is None:
+            reasons.append("Missing fused emotion")
+        elif context.fused.confidence < context.action_threshold:
+            reasons.append(f"Confidence {context.fused.confidence:.2f} below threshold {context.action_threshold}")
+        if context.fused is not None and (
+            EmotionSource.ACOUSTIC not in context.fused.modalities
+            or EmotionSource.SEMANTIC not in context.fused.modalities
+        ):
+            reasons.append(f"Missing modalities: {context.fused.modalities}")
+        if context.fused is not None and context.fused.mixed:
+            reasons.append("Emotion signals are mixed/conflicting")
         if context.is_late:
-            authorized = False
+            reasons.append("Acoustic result was late")
         if context.has_cooldown:
-            authorized = False
-        if not context.is_demo_mode:
-            authorized = False
+            reasons.append("Intervention is on cooldown")
+
+        screen_cmd = action.get("screen", {}).get("command")
+        if (
+            screen_cmd == "show_specific"
+            and context.fused is not None
+            and context.fused.label == EmotionLabel.ANXIETY
+        ):
+            reasons.append("Blocked auto photo switch during anxiety")
             
-        if action.get("name") == "show_photo" and context.fused.label == EmotionLabel.ANXIETY:
-            authorized = False
+        if not reasons and not context.is_demo_mode:
+            reasons.append("Blocked emotion action outside demo mode")
             
-        if authorized:
-            action["loop"] = False
-            action["volume"] = 60
+        if not reasons:
+            if "audio" in action and isinstance(action["audio"], dict):
+                action["audio"]["loop"] = False
+                action["audio"]["volume"] = 60
             result["action"] = action
         else:
-            result["action"] = {
-                "source": "emotion",
-                "name": "keep",
-                "target": "",
-                "loop": False,
-                "volume": 60
-            }
+            action["source"] = "none"
+            for key in ["mist", "audio", "screen"]:
+                if key in action and isinstance(action[key], dict):
+                    action[key]["command"] = "keep"
+                else:
+                    action[key] = {"command": "keep"}
+            result["action"] = action
             
-        return PolicyDecision(authorized_json=result)
+        return PolicyDecision(authorized_json=result, reasons=reasons)
         
     logger.info("Legacy action source passed unchanged")
-    return PolicyDecision(authorized_json=result)
+    return PolicyDecision(authorized_json=result, reasons=["Legacy source passed unchanged"])

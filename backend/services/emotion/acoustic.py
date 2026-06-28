@@ -36,7 +36,8 @@ class DashScopeAcousticEmotionClient:
                 "rather than the factual content. Choose exactly one label from: "
                 "joy, sadness, anxiety, anger, fatigue, loneliness, calm, neutral. "
                 "Output MUST be exactly a JSON object with 'label' (string), 'confidence' (float 0.0-1.0), "
-                "and 'valence' (float -1.0 to 1.0). Do not include any other text or markdown."
+                "'valence' (float -1.0 to 1.0), 'arousal' (float 0.0 to 1.0), and 'intensity' (float 0.0 to 1.0). "
+                "Do not include any other text or markdown."
             )
 
             payload = {
@@ -82,6 +83,8 @@ class DashScopeAcousticEmotionClient:
             result_map = json.loads(content_str)
             return EmotionSignal.from_mapping(result_map, source=EmotionSource.ACOUSTIC)
             
-        except Exception:
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Acoustic analysis failed: {e}")
             # Fail closed to neutral without logging response bodies or keys
             return EmotionSignal.neutral(EmotionSource.ACOUSTIC)
