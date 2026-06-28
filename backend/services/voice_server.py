@@ -410,6 +410,31 @@ def _extract_photo_search_query(text: str) -> str:
     query = re.sub(r"(?:的|一下|给我)$", "", query).strip()
     return query
 
+def _photo_search_query_candidates(keyword: str) -> list[str]:
+    """Return fast local-search candidates before the original semantic query."""
+    value = (keyword or "").strip()
+    if not value:
+        return []
+
+    aliases = (
+        (("小狗", "狗狗", "犬", "小犬"), "狗"),
+        (("小猫", "猫猫", "猫咪", "咪咪"), "猫"),
+        (("鸭子", "小鸭", "鸭鸭"), "鸭"),
+        (("小屋", "房子", "房屋", "屋子"), "房屋"),
+    )
+    candidates = []
+    for words, normalized in aliases:
+        if any(word in value for word in words):
+            candidates.append(normalized)
+            break
+    candidates.append(value)
+
+    unique = []
+    for candidate in candidates:
+        if candidate and candidate not in unique:
+            unique.append(candidate)
+    return unique
+
 def _is_random_photo_request(text: str) -> bool:
     value = (text or "").strip()
     if not value:
@@ -469,21 +494,7 @@ def _set_device_view(target_id: str = "", orientation: str = "keep") -> None:
 
 def _extract_fallback_photo_query(text: str, orientation: str = "") -> str:
     query = _extract_photo_search_query(text)
-    if query or not orientation:
-        return query
-
-    value = (text or "").strip()
-    for phrase in (
-        "竖屏显示", "横屏显示", "竖屏", "横屏",
-        "竖向", "横向", "纵向", "水平", "竖着", "横着",
-        "帮我", "请你", "给我", "把", "同时", "一起", "并且", "然后",
-        "切换成", "切换到", "切换", "更换成", "更换", "换成", "换到",
-        "改成", "改为", "设置成", "设置", "调整为", "调整", "显示",
-    ):
-        value = value.replace(phrase, " ")
-    value = re.sub(r"[，。！？,.!?]", " ", value)
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
+    return query
 
 def _load_system_prompt():
     prompt_path = os.path.join(ROOT_DIR, "voice_system_prompt.md")
@@ -1689,6 +1700,9 @@ class VoiceServer:
                 screen["url"] = (
                     f"http://{local_ip}:8765/api/photo/{target_photo['id']}.jpg"
                 )
+            else:
+                screen["command"] = "keep"
+                screen["url"] = ""
             for sk, sc in SCENE_MAP.items():
                 if sk in kw: scene_hit = sc; break
 
@@ -1759,17 +1773,19 @@ class VoiceServer:
             return {}
 
     def _search_photo_result(self, keyword):
-        try:
-            import urllib.parse
-            import urllib.request
-            query = urllib.parse.urlencode({"q": keyword})
-            url = f"http://127.0.0.1:8765/api/photo/search?{query}"
-            with urllib.request.urlopen(url, timeout=35) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            if result.get("id"):
-                return result
-        except Exception as exc:
-            print(f"[WARN] 照片语义检索失败: {exc}")
+        import urllib.parse
+        import urllib.request
+
+        for candidate in _photo_search_query_candidates(keyword):
+            try:
+                query = urllib.parse.urlencode({"q": candidate})
+                url = f"http://127.0.0.1:8765/api/photo/search?{query}"
+                with urllib.request.urlopen(url, timeout=35) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                if result.get("id"):
+                    return result
+            except Exception as exc:
+                print(f"[WARN] 照片检索失败: {candidate}: {exc}")
         return {}
 
     def _search_photo(self, keyword, local_ip):
