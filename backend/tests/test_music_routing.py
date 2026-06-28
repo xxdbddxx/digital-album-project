@@ -64,6 +64,46 @@ class MusicRoutingTests(unittest.TestCase):
 
         self.assertEqual(raw["action"]["audio"]["url"], "<search: sad>")
 
+    @patch.object(voice_server, "_available_music_files", return_value=[])
+    def test_explicit_music_request_overrides_model_emotion_source(
+        self, _available
+    ):
+        server = voice_server.VoiceServer.__new__(voice_server.VoiceServer)
+        raw = {
+            "dialogue": {"tts_text": "好的", "emotion": "neutral"},
+            "action": {
+                "source": "emotion",
+                "audio": {"command": "keep"},
+                "screen": {"command": "keep"},
+            },
+        }
+
+        server._complete_llm_view_intent(raw, "播放悲伤的音乐")
+
+        self.assertEqual(raw["action"]["source"], "explicit")
+        self.assertEqual(raw["action"]["audio"]["command"], "play")
+
+    @patch.object(
+        voice_server, "_extract_photo_search_query", return_value="猫"
+    )
+    def test_explicit_photo_request_overrides_model_emotion_source(
+        self, _extract_query
+    ):
+        server = voice_server.VoiceServer.__new__(voice_server.VoiceServer)
+        raw = {
+            "dialogue": {"tts_text": "好的", "emotion": "neutral"},
+            "action": {
+                "source": "emotion",
+                "audio": {"command": "keep"},
+                "screen": {"command": "keep"},
+            },
+        }
+
+        server._complete_llm_view_intent(raw, "显示一张猫的照片")
+
+        self.assertEqual(raw["action"]["source"], "explicit")
+        self.assertEqual(raw["action"]["screen"]["command"], "show_specific")
+
     def test_extracts_final_dialogue_emotion(self):
         response = (
             '{"dialogue":{"tts_text":"我会陪着你。","emotion":"empathic"},'
@@ -73,6 +113,15 @@ class MusicRoutingTests(unittest.TestCase):
         emotion = voice_server._extract_dialogue_emotion(response)
 
         self.assertEqual(emotion, "empathic")
+
+    def test_preserves_old_dialogue_emotion_compatibility(self):
+        from backend.services.emotion.streaming import extract_user_emotion
+        response = (
+            '{"dialogue":{"tts_text":"我会陪着你。","emotion":"empathic"},'
+            '"action":{"audio":{"command":"keep"}}}'
+        )
+        self.assertIsNone(extract_user_emotion(response))
+        self.assertEqual(voice_server._extract_dialogue_emotion(response), "empathic")
 
 
 if __name__ == "__main__":

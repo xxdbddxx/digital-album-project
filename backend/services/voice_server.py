@@ -337,6 +337,23 @@ def _post_asr_text_to_flask(user_text: str):
     except Exception as e:
         print(f"⚠️  [voice_server] ASR 回调 Flask 失败: {e}")
 
+def _decode_streaming_json_string(raw_value: str) -> str:
+    escapes = {
+        "\b": "\\b",
+        "\f": "\\f",
+        "\n": "\\n",
+        "\r": "\\r",
+        "\t": "\\t",
+    }
+    sanitized = "".join(
+        escapes.get(char, f"\\u{ord(char):04x}")
+        if ord(char) < 0x20
+        else char
+        for char in raw_value
+    )
+    return json.loads('"' + sanitized + '"')
+
+
 def _extract_tts_text(llm_text: str) -> str:
     if not llm_text:
         return ""
@@ -350,7 +367,7 @@ def _extract_tts_text(llm_text: str) -> str:
             r'"tts_text"\s*:\s*"((?:[^"\\]|\\.)*?)"', llm_text
         )
         if match:
-            return json.loads('"' + match.group(1) + '"')
+            return _decode_streaming_json_string(match.group(1))
     except Exception:
         pass
     return llm_text
@@ -606,6 +623,31 @@ class VoiceServer:
             self.vad_ok = False
             print("⚠️  webrtcvad 未安装，使用能量检测回退")
 
+        # ── Emotion Pipeline ──
+        try:
+            from backend.services.emotion.models import EmotionConfig
+            from backend.services.emotion.acoustic import DashScopeAcousticEmotionClient
+            from backend.services.emotion.session import EmotionSessionStore
+            from backend.services.emotion.metrics import EmotionMetricStore
+            self.emotion_config = EmotionConfig.from_mapping(os.environ)
+            api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+            self.acoustic_emotion = DashScopeAcousticEmotionClient(api_key=api_key) if api_key else None
+            self.emotion_sessions = EmotionSessionStore(
+                window_turns=self.emotion_config.session_window_turns,
+                cooldown_sec=self.emotion_config.intervention_cooldown_sec
+            )
+            self.emotion_metrics = EmotionMetricStore()
+            if self.emotion_config.enabled:
+                print(f"✅ Emotion Pipeline: Enabled")
+            else:
+                print(f"⚠️ Emotion Pipeline: Disabled")
+        except Exception as e:
+            self.emotion_config = None
+            self.acoustic_emotion = None
+            self.emotion_sessions = None
+            self.emotion_metrics = None
+            print(f"⚠️ Emotion Pipeline 加载失败: {e}")
+
         # ── TTS 优先级: 阿里云 CosyVoice → edge-tts → piper ──
         self.aliyun_tts_ok = self._check_aliyun_tts()
         self.edge_tts_ok = self._check_edge_tts()
@@ -665,6 +707,26 @@ class VoiceServer:
             return False
         except Exception:
             return False
+
+    def _clear_session(self, client_ip):
+        if hasattr(self, 'emotion_sessions') and self.emotion_sessions:
+            self.emotion_sessions.clear(client_ip)
+
+    async def _wait_for_acoustic_result(self, pcm_data):
+        if not self.emotion_config or not self.emotion_config.enabled:
+            return None
+        if not getattr(self, 'acoustic_emotion', None):
+            return None
+        import asyncio
+        try:
+            timeout_ms = getattr(self.emotion_config, "acoustic_timeout_ms", 400)
+            return await asyncio.wait_for(
+                asyncio.to_thread(self.acoustic_emotion.analyze, pcm_data, timeout_ms / 1000.0),
+                timeout=(timeout_ms / 1000.0) + 0.2
+            )
+        except Exception as e:
+            print(f"⚠️ Acoustic emotion analysis failed/timed out: {e}")
+            return None
 
     # ════════════════════════════════════════════════════════════════
     # WebSocket 客户端处理（每个连接一个协程）
@@ -790,6 +852,7 @@ class VoiceServer:
                         st["cancel_requested"] = True # 💡 唤醒时立即标记打断上一轮
                         st["is_web_simulated"] = False
                         self.sessions.pop(client_ip, None)  # 新会话：清除历史
+                        self._clear_session(client_ip)
 
                     elif event == "recording_started":
                         print(f"🎤 [{client_ip}] 录音开始")
@@ -829,6 +892,7 @@ class VoiceServer:
                     elif event == "session_end":
                         print(f"🔇 [{client_ip}] 会话结束")
                         self.sessions.pop(client_ip, None)
+                        self._clear_session(client_ip)
 
                 except json.JSONDecodeError:
                     pass
@@ -873,6 +937,7 @@ class VoiceServer:
         st["pipeline_running"] = True
         st["asr_running"] = True
         st["cancel_requested"] = False # 💡 开启新一轮 Pipeline，在此重置打断状态
+        acoustic_collector_task = None
         try:
             loop = asyncio.get_running_loop()
 
@@ -934,6 +999,11 @@ class VoiceServer:
                 print(f"✅ [{client_ip}] Echo 回复包推送完毕。")
                 return
 
+            # ── 阶段 0: 情绪声学分析 (后台并发) ──
+            acoustic_task = None
+            if not text_override and getattr(self, 'emotion_config', None) and self.emotion_config.enabled:
+                acoustic_task = asyncio.create_task(self._wait_for_acoustic_result(pcm_data))
+
             # ── 阶段 1: ASR（线程池）──
             if text_override:
                 transcribed = text_override
@@ -958,7 +1028,44 @@ class VoiceServer:
             
             tts_queue = asyncio.Queue()
             pcm_queue = asyncio.Queue()
-            tts_state = {"queued": 0}
+            tts_state = {
+                "queued": 0,
+                "acoustic_late": False,
+                "acoustic_pending": acoustic_task is not None,
+                "semantic_signal_extracted": False,
+            }
+
+            async def collect_acoustic_result():
+                try:
+                    signal = await acoustic_task
+                    tts_state["acoustic_pending"] = False
+                    if tts_state.get("semantic_signal_extracted"):
+                        tts_state["acoustic_late"] = True
+                        return
+                    if signal:
+                        tts_state["acoustic_signal"] = signal
+                        print(
+                            f"🎵 [{client_ip}] 声学情绪: "
+                            f"{signal.label.value} ({signal.confidence:.2f})"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    tts_state["acoustic_pending"] = False
+
+            if acoustic_task:
+                if acoustic_task.done():
+                    try:
+                        signal = acoustic_task.result()
+                        tts_state["acoustic_pending"] = False
+                        if signal:
+                            tts_state["acoustic_signal"] = signal
+                    except Exception:
+                        tts_state["acoustic_pending"] = False
+                else:
+                    acoustic_collector_task = asyncio.create_task(
+                        collect_acoustic_result()
+                    )
             
             async def tts_consumer():
                 st["tts_generating"] = True
@@ -975,8 +1082,9 @@ class VoiceServer:
                             "text": display_text,
                             "emotion": "neutral",
                         }, ensure_ascii=False))
+                        fused_emotion = tts_state.get("fused_emotion") if tts_state else None
                         pcm_res = await asyncio.to_thread(
-                            self._generate_tts_audio_only, sentence, client_ip
+                            self._generate_tts_audio_only, sentence, client_ip, fused_emotion
                         )
                         if pcm_res:
                             await pcm_queue.put(pcm_res)
@@ -999,7 +1107,8 @@ class VoiceServer:
 
             full_text = await asyncio.to_thread(
                 self._call_llm_stream, transcribed, st, websocket, loop,
-                client_ip, tts_queue, tts_state
+                client_ip, tts_queue, tts_state,
+                tts_state.get("acoustic_signal"),
             )
             st["llm_streaming"] = False
             if full_text and not st.get("cancel_requested"):
@@ -1037,7 +1146,11 @@ class VoiceServer:
 
             # ── 阶段 3: 解析 CJSON ──
             parsed = self._parse_llm_json(
-                full_text or transcribed, client_ip, transcribed
+                full_text or transcribed,
+                client_ip,
+                transcribed,
+                tts_state.get("fused_emotion") if tts_state else None,
+                is_late=bool(tts_state.get("acoustic_late")) if tts_state else False,
             )
             cjson, _view_handled = parsed if parsed else (None, False)
             if cjson:
@@ -1056,6 +1169,8 @@ class VoiceServer:
             import traceback
             traceback.print_exc()
         finally:
+            if acoustic_collector_task and not acoustic_collector_task.done():
+                acoustic_collector_task.cancel()
             st["pipeline_running"] = False
             st["asr_running"] = False
             st["llm_streaming"] = False
@@ -1176,7 +1291,7 @@ class VoiceServer:
     # ════════════════════════════════════════════════════════════════
 
     def _call_llm_stream(self, user_text, st, websocket, loop, client_ip,
-                         tts_queue=None, tts_state=None):
+                         tts_queue=None, tts_state=None, acoustic_signal=None, emotion_turn=None):
         """调用当前 LLM 提供商，token 通过 asyncio 跨线程推送到 ESP32。"""
         if LLM_PROVIDER == "deepseek":
             if not self.deepseek_ok:
@@ -1198,7 +1313,19 @@ class VoiceServer:
         history = self.sessions.get(client_ip, [])
         messages = [{"role": "system", "content": full_prompt}]
         messages += history[-self.MAX_HISTORY_TURNS * 2:]  # 最近 N 轮（每轮 user+assistant）
-        messages.append({"role": "user", "content": user_text})
+        
+        # Supply acoustic context when it was ready before LLM startup.
+        initial_acoustic_signal = (
+            tts_state.get("acoustic_signal")
+            if tts_state is not None
+            else acoustic_signal
+        )
+        if initial_acoustic_signal:
+            user_text_with_ctx = f"{user_text}\n[系统侦测到用户的语音情绪为: {initial_acoustic_signal.label.value}]"
+        else:
+            user_text_with_ctx = user_text
+            
+        messages.append({"role": "user", "content": user_text_with_ctx})
 
         try:
             import urllib.request
@@ -1241,6 +1368,7 @@ class VoiceServer:
             total_processed_text = ""
             current_sentence = ""
             tts_extraction_active = True
+            semantic_signal_extracted = False
 
             with urllib.request.urlopen(req, timeout=120) as resp:
                 for line in resp:
@@ -1277,6 +1405,35 @@ class VoiceServer:
                             )
                             
                             # 提取 TTS 文本并按标点推入队列
+                            if not semantic_signal_extracted and json_buffer:
+                                from backend.services.emotion.streaming import extract_user_emotion
+                                semantic_signal = extract_user_emotion(json_buffer)
+                                if semantic_signal:
+                                    semantic_signal_extracted = True
+                                    if tts_state is not None:
+                                        tts_state["semantic_signal_extracted"] = True
+                                    current_acoustic_signal = (
+                                        tts_state.get("acoustic_signal")
+                                        if tts_state is not None
+                                        else acoustic_signal
+                                    )
+                                    if (
+                                        tts_state is not None
+                                        and current_acoustic_signal is None
+                                        and tts_state.get("acoustic_pending")
+                                    ):
+                                        tts_state["acoustic_late"] = True
+                                    from backend.services.emotion.fusion import fuse_emotions
+                                    fused = fuse_emotions(
+                                        current_acoustic_signal,
+                                        semantic_signal,
+                                    )
+                                    if getattr(self, 'emotion_sessions', None):
+                                        fused = self.emotion_sessions.update(client_ip, fused)
+                                    if tts_state is not None:
+                                        tts_state["fused_emotion"] = fused
+                                    print(f"🧠 [{client_ip}] 融合情绪: {fused.label.value} (conf: {fused.confidence:.2f})")
+
                             if tts_queue and tts_extraction_active:
                                 match = re.search(r'"tts_text"\s*:\s*"((?:[^"\\]|\\.)*)', json_buffer)
                                 if match:
@@ -1284,7 +1441,9 @@ class VoiceServer:
                                     try:
                                         # 正确的反转义方法：利用 json.loads 处理标准的 JSON 字符串
                                         # 这样既能保留原生的中文，又能正确解析 \n 和 \uXXXX
-                                        decoded = json.loads('"' + raw_val + '"')
+                                        decoded = _decode_streaming_json_string(
+                                            raw_val
+                                        )
                                         new_chars = decoded[len(total_processed_text):]
                                         if new_chars:
                                             current_sentence += new_chars
@@ -1339,7 +1498,7 @@ class VoiceServer:
     # 阶段 3: piper-tts 流式生成 PCM（同步 → 线程池调用）
     # ════════════════════════════════════════════════════════════════
 
-    def _generate_tts_audio_only(self, text, client_ip):
+    def _generate_tts_audio_only(self, text, client_ip, fused_emotion=None):
         """TTS：仅生成音频 PCM 数据，与网络流式发送解耦，避免阻塞下一句生成。返回 (引擎名, pcm_data)。"""
         if not text:
             return None
@@ -1359,13 +1518,27 @@ class VoiceServer:
                 dashscope.base_websocket_api_url = (
                     "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
                 )
+                speech_rate = max(
+                    0.5, min(2.0, ALIYUN_TTS_SPEECH_RATE)
+                )
+                if fused_emotion:
+                    from backend.services.emotion.policy import speech_rate_for
+                    rate_multiplier = speech_rate_for(fused_emotion.label)
+                    speech_rate = max(
+                        0.5,
+                        min(
+                            2.0,
+                            ALIYUN_TTS_SPEECH_RATE * rate_multiplier,
+                        ),
+                    )
                 synthesizer = SpeechSynthesizer(
                     model=ALIYUN_TTS_MODEL,
                     voice=ALIYUN_TTS_VOICE,
                     format=AudioFormat.PCM_16000HZ_MONO_16BIT,
                     volume=max(0, min(100, ALIYUN_TTS_VOLUME)),
-                    speech_rate=max(0.5, min(2.0, ALIYUN_TTS_SPEECH_RATE)),
+                    speech_rate=speech_rate,
                 )
+
                 pcm_data = synthesizer.call(text)
                 if pcm_data:
                     print(
@@ -1560,7 +1733,14 @@ class VoiceServer:
     # CJSON 解析 + 宏指令解析（不变）
     # ════════════════════════════════════════════════════════════════
 
-    def _parse_llm_json(self, text, client_ip, user_text=""):
+    def _parse_llm_json(
+        self,
+        text,
+        client_ip,
+        user_text="",
+        fused_emotion=None,
+        is_late=False,
+    ):
         if not text: return None
         cleaned = text.strip()
         
@@ -1584,6 +1764,103 @@ class VoiceServer:
         if not isinstance(raw, dict) or "dialogue" not in raw:
             return None
         self._complete_llm_view_intent(raw, user_text)
+        
+        # Emotion policy gating
+        raw_action = raw.get("action", {})
+        emotion_action = raw_action.get("source") == "emotion"
+        emotion_enabled = (
+            getattr(self, "emotion_config", None)
+            and self.emotion_config.enabled
+        )
+        action_decision = None
+        if emotion_action:
+            from backend.services.emotion.policy import PolicyContext, authorize_actions
+            import time
+            now = time.time()
+            policy_fused_emotion = (
+                fused_emotion if emotion_enabled else None
+            )
+
+            categories = []
+            for key in ["mist", "audio", "screen"]:
+                cmd = raw_action.get(key, {}).get("command", "keep")
+                if cmd != "keep":
+                    label = (
+                        policy_fused_emotion.label.value
+                        if policy_fused_emotion is not None
+                        else "unknown"
+                    )
+                    categories.append(f"{key}:{label}")
+
+            primary_category = categories[0] if categories else "default"
+            has_cooldown = (
+                not self.emotion_sessions.can_intervene(
+                    client_ip, primary_category, now
+                )
+                if getattr(self, "emotion_sessions", None)
+                else False
+            )
+
+            ctx = PolicyContext(
+                fused=policy_fused_emotion,
+                is_demo_mode=(
+                    self.emotion_config.demo_mode
+                    if emotion_enabled
+                    else False
+                ),
+                action_threshold=(
+                    self.emotion_config.action_threshold
+                    if emotion_enabled
+                    else 0.80
+                ),
+                has_cooldown=has_cooldown,
+                is_late=is_late
+            )
+            decision = authorize_actions(raw, ctx)
+            action_decision = decision
+            raw = decision.authorized_json
+            
+            # Record intervention if action isn't 'keep'
+            action = raw.get("action", {})
+            for key in ["mist", "audio", "screen"]:
+                comp = action.get(key, {})
+                cmd = comp.get("command", "keep")
+                if (
+                    cmd != "keep"
+                    and getattr(self, "emotion_sessions", None)
+                ):
+                    self.emotion_sessions.mark_intervention(client_ip, primary_category, now)
+                    break
+
+        if emotion_action and getattr(self, "emotion_metrics", None):
+            from backend.services.emotion.metrics import build_turn_metric
+            from backend.services.emotion.policy import style_for
+
+            response_style = (
+                style_for(fused_emotion.label).value
+                if fused_emotion is not None
+                else None
+            )
+            deadline_status = (
+                "late"
+                if is_late
+                else "missing"
+                if fused_emotion is None
+                else "ok"
+            )
+            self.emotion_metrics.record(
+                build_turn_metric(
+                    client_id=client_ip,
+                    acoustic_signal=None,
+                    semantic_signal=None,
+                    fused_emotion=fused_emotion,
+                    action_decision=action_decision,
+                    timing={},
+                    deadline_status=deadline_status,
+                    response_style=response_style,
+                )
+            )
+
         return self._resolve_cjson(raw, client_ip)
 
     def _complete_llm_view_intent(self, raw, user_text):
@@ -1610,6 +1887,7 @@ class VoiceServer:
             or category_requested
             or filename_requested
         ):
+            action["source"] = "explicit"
             if any(word in user_text for word in stop_words):
                 audio["command"] = "stop"
                 audio["url"] = ""
@@ -1628,15 +1906,22 @@ class VoiceServer:
             "亮度", "调亮", "调暗", "亮一点", "暗一点",
             "亮屏", "开屏", "黑屏", "关屏",
         )
-        if not any(word in user_text for word in brightness_words):
+        has_brightness_request = any(
+            word in user_text for word in brightness_words
+        )
+        if has_brightness_request:
+            action["source"] = "explicit"
+        else:
             screen.pop("brightness", None)
         orientation = _extract_orientation_command(user_text)
         current_orientation = str(
             screen.get("orientation") or "keep"
         ).strip().lower()
-        if orientation and current_orientation not in {"portrait", "landscape"}:
-            screen["orientation"] = orientation
-            print(f"🧩 [LLM校验] 补齐屏幕方向: {orientation}")
+        if orientation:
+            action["source"] = "explicit"
+            if current_orientation not in {"portrait", "landscape"}:
+                screen["orientation"] = orientation
+                print(f"🧩 [LLM校验] 补齐屏幕方向: {orientation}")
 
         photo_query = (
             _extract_fallback_photo_query(user_text, orientation)
@@ -1644,6 +1929,7 @@ class VoiceServer:
             else _extract_photo_search_query(user_text)
         )
         if photo_query:
+            action["source"] = "explicit"
             screen["command"] = "show_specific"
             screen["url"] = f"<search: {photo_query}>"
             screen.setdefault("hold_mode", "until_midnight")
@@ -1651,6 +1937,7 @@ class VoiceServer:
             return
 
         if _is_random_photo_request(user_text):
+            action["source"] = "explicit"
             screen["command"] = "show_specific"
             screen["url"] = "<random>"
             screen.setdefault("hold_mode", "until_midnight")
