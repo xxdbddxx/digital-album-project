@@ -2,16 +2,28 @@
 
 This repository does not commit machine-specific runtime state. Each teammate must configure their own backend secrets, local IP, Python environment, and ESP32 serial port before flashing.
 
+## What is committed for the demo
+
+The repository includes the current demo runtime dataset so teammate machines can reproduce photo and music behavior:
+
+- `backend/upload.db`: upload/device photo metadata, including cached semantic embeddings in `device_photos.embedding_json`.
+- `backend/photos.db`: library photo metadata.
+- `backend/upload_photos/`: demo photos plus generated RGB565/preview variants.
+- `backend/music/`: demo music files.
+- `backend/music_tags.json`: music tag manifest.
+
+These files are committed only as competition demo assets. Do not put API keys or private credentials into databases or media metadata.
+
 ## What is intentionally not committed
 
 - `backend/.env.local`: API keys and local secrets.
 - `backend/.venv/`: local Python virtual environment.
 - `sdkconfig`: local firmware config containing the current PC IP.
-- `backend/*.db`, `backend/upload_photos/`, `backend/services/user_records/`, `backend/output/`: local runtime data.
+- `backend/services/user_records/`, `backend/services/response_records/`, `backend/output/`: local runtime logs/recordings.
 - `build/`: ESP-IDF build output.
-- Large local media/model assets such as `backend/music/*.mp3` and Piper voices.
+- Large local model assets such as Piper voices.
 
-If a teammate needs demo photos/music, share a separate sanitized demo asset package instead of committing personal runtime data or API keys.
+If new demo photos or music are added later, verify they contain no secrets and force-add them if they are still covered by `.gitignore`.
 
 ## First-time setup
 
