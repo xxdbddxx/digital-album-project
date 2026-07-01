@@ -102,7 +102,13 @@ function Stop-ProcessTree {
     if ($ProcessId -le 0 -or $ProcessId -eq $PID) {
         return
     }
+    if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+        return
+    }
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     & taskkill.exe /PID $ProcessId /T /F *> $null
+    $ErrorActionPreference = $previousPreference
 }
 
 function Stop-DedicatedBackendWindows {
@@ -294,7 +300,7 @@ Write-Host "Closing existing backend windows and listeners..."
 Stop-DedicatedBackendWindows -WindowTitles $windowTitles
 $listenerIds = Get-ListeningProcessIds $ports
 $orphanIds = Get-SafeBackendOrphanProcessIds -ProjectRoot $projectRoot
-$targetIds = @($listenerIds + $orphanIds | Sort-Object -Unique)
+$targetIds = @(@($listenerIds) + @($orphanIds) | Sort-Object -Unique)
 $treeRoots = Get-BackendTreeRoots $targetIds
 foreach ($rootId in $treeRoots) {
     Stop-ProcessTree -ProcessId $rootId
